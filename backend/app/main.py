@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import health as liveness
 from app.api.v1.router import api_router
 from app.core.config import Settings, get_settings
+from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestContextMiddleware
 
@@ -59,6 +60,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         swagger_ui_oauth2_redirect_url=f"{settings.api_v1_prefix}/docs/oauth2-redirect",
         lifespan=lifespan,
     )
+
+    # Published so route dependencies read the settings this app was built
+    # with, rather than the process-wide cache (see api/deps.get_app_settings).
+    app.state.settings = settings
+
+    # Centralised error handling: one envelope for every failure, and no
+    # stack trace ever reaches a client in production (app/core/errors.py).
+    register_exception_handlers(app, settings)
 
     app.add_middleware(RequestContextMiddleware)
     app.add_middleware(

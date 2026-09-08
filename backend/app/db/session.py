@@ -26,7 +26,9 @@ def get_engine() -> Engine:
     """
     settings = get_settings()
     return create_engine(
-        settings.database_url,
+        # get_secret_value() is the one place the DSN is unwrapped. SecretStr
+        # keeps it out of reprs, logs and tracebacks everywhere else.
+        settings.database_url.get_secret_value(),
         pool_pre_ping=True,
         future=True,
     )

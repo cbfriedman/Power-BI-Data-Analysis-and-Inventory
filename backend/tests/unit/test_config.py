@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import SecretStr
 
 from app.core.config import Settings, get_settings
 
@@ -57,5 +58,5 @@ def test_no_credential_is_hardcoded_as_a_working_default() -> None:
     """
     default_url = Settings.model_fields["database_url"].default
 
-    assert isinstance(default_url, str)
-    assert "localhost" in default_url
+    assert isinstance(default_url, SecretStr)
+    assert "localhost" in default_url.get_secret_value()

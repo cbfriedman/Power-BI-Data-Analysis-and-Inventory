@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-08
+Last updated: 2026-09-08 (security foundation)
 
 ---
 
@@ -10,17 +10,17 @@ Last updated: 2026-09-08
 | | |
 |---|---|
 | Milestone | 1 — Data foundation, ingestion, matching |
-| Stage | **Phase 1 (database foundation) complete. Audit *table* built; audit *service* not yet written.** |
-| Application code | Backend service skeleton, full schema, frontend shell. No business logic. |
+| Stage | **Phase 1 complete.** Schema, audit service, and the configuration/security foundation are built. |
+| Application code | Schema, audit service, auth foundation, error handling, redaction. No vendor/import/matching logic. |
 | Database schema | 21 tables, 21 enum types, 113 indexes, 61 check constraints, 73 foreign keys, 1 append-only trigger |
 | Migrations | 1 revision, applied and reversed against PostgreSQL 16.15 |
-| Backend tests | 98, all passing (21 unit, 77 database-backed) |
+| Backend tests | 210, all passing (104 unit, 106 database-backed) |
 | Quality gates | 8 of 8 passing locally (§4) |
 | Docker stack | **Still unverified** — see §6, issue S1 |
-| Blocking questions open | 7 (see §7) |
+| Blocking questions open | 7 (see §7); B2 narrowed to two decisions |
 
-The schema exists and is verified. Nothing yet reads a vendor file, calls
-Nineyard, matches a product, or writes an audit row.
+The schema, the audit writer, and the security foundation exist and are
+verified. Nothing yet reads a vendor file, calls Nineyard, or matches a product.
 
 ---
 
@@ -32,16 +32,16 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 |---|---|---|---|
 | — | Planning and documentation | ✅ Complete | Scope, architecture, criteria, 10 ADRs |
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates |
-| 1 | DB foundation + audit | 🟨 In progress | Schema and migration done; `audit_events` table and trigger exist. The transactional audit *writer service* (ADR 0006) is not built. |
-| 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD |
+| 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
+| 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
 | 3 | Nineyard integration + sync | 🚫 Blocked | Blocked by B1 — no API specification. `nineyard_sync_runs` and `source_records` tables exist; no client. |
 | 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
 | 5 | File ingestion + raw retention | ⬜ Not started | `import_files` exists; no `StorageBackend` yet |
 | 6 | Parsing + validation + reporting | ⬜ Not started | Needs sample files (B4) |
 | 7 | Matching engine | ⬜ Not started | Schema supports the full priority chain; engine unwritten |
-| 8 | Exception workflow | ⬜ Not started | `product_mapping_exceptions` exists; needs B2 for actor identity |
+| 8 | Exception workflow | ⬜ Not started | `product_mapping_exceptions` exists; `Principal` now supplies actor identity, so no longer blocked by B2 |
 | 9 | Inventory, availability, watchlist | ⬜ Not started | All four tables exist; no diffing logic |
-| 10 | Admin interface | ⬜ Not started | Shell exists; screens are placeholders |
+| 10 | Admin interface | ⬜ Not started | Shell exists; screens are placeholders. Needs a sign-in flow once B2 settles. |
 | 11 | Hardening | ⬜ Not started | |
 
 Legend: ✅ complete · 🟨 in progress · ⬜ not started · 🚫 blocked
@@ -90,6 +90,36 @@ The parts that carry the most weight:
 * **Audit is append-only in the database.** A trigger rejects `UPDATE` and
   `DELETE` on `audit_events`, including from a direct psql session.
 
+### Configuration and security foundation
+
+Full detail in [docs/security.md](security.md). In brief:
+
+* **Secrets are typed.** `DATABASE_URL`, `AUTH_JWT_SECRET` and
+  `NINEYARD_API_KEY` are `SecretStr`, so they cannot be printed by accident.
+  Reading a real value takes an explicit `.get_secret_value()` — there are three
+  such calls, all at genuine boundaries.
+* **Production refuses development defaults.** The shipped signing key, the dev
+  token endpoint, and error-detail exposure each prevent start-up when
+  `APP_ENV=production`. A signing key under 32 characters is refused everywhere.
+* **Log redaction at the sink.** Key-based masking plus pattern matching for
+  bearer tokens, bare JWTs, DSN passwords, and inline `api_key=` assignments —
+  applied on both the structlog path and the stdlib path used by third-party
+  libraries. The same functions clean audit payloads.
+* **Correlation ids** flow from middleware through a context variable into log
+  lines, audit rows, and error responses.
+* **One error envelope** for application errors, Starlette's own errors,
+  validation failures, and unhandled exceptions. **No stack trace ever reaches a
+  client in production.**
+* **Audit writer** (ADR 0006): adds the row to the caller's session and does not
+  commit, so a change and its audit entry share one transaction.
+* **Transaction utilities**: `transaction()`, `savepoint()`, `session_scope()`.
+* **Replaceable authentication.** A development JWT backend behind an
+  `AuthenticationBackend` protocol, with four roles — `ADMIN`,
+  `PURCHASING_MANAGER`, `DATA_OPERATOR`, `VIEWER`. Authorization always reads
+  the database, never token claims, so a revocation applies on the next request.
+* **`.gitignore` hardened** against token caches, credential files, and imported
+  client data — verified by running `git check-ignore`, not by inspection.
+
 ### Migration
 
 One revision, `506fd0ecc33a`. Beyond the autogenerated tables it enables
@@ -101,22 +131,23 @@ in a real deployment. A test asserts the round trip.
 
 ### Deliberately absent
 
-No Nineyard client, no file parsing, no matching engine, no audit writer service,
-no API endpoints beyond health, no authentication. Tables were built; behaviour
-was not.
+No Nineyard client, no file parsing, no matching engine, and no vendor or
+import endpoints. No password storage, MFA, refresh tokens, or rate limiting —
+Entra ID will own credentials, and building a half-credential store first would
+be work thrown away ([security.md §8](security.md) lists this honestly).
 
 ---
 
 ## 4. Quality gate results
 
-Run on 2026-09-08. Windows 11, Python 3.12.10, Node 24.19.0, PostgreSQL 16.15.
+Run on 2026-09-08 (security foundation). Windows 11, Python 3.12.10, Node 24.19.0, PostgreSQL 16.15.
 
 | Gate | Command | Result |
 |---|---|---|
-| Backend format | `ruff format .` | ✅ 55 files unchanged |
+| Backend format | `ruff format .` | ✅ 72 files unchanged |
 | Backend lint | `ruff check .` | ✅ All checks passed |
-| Backend types | `mypy` (strict) | ✅ No issues in 53 source files |
-| Backend tests | `pytest` | ✅ **98 passed** (21 unit, 77 database-backed) |
+| Backend types | `mypy` (strict) | ✅ No issues in 70 source files |
+| Backend tests | `pytest` | ✅ **210 passed** (104 unit, 106 database-backed) |
 | Migration apply | `alembic upgrade head` | ✅ Applied to PostgreSQL 16.15 |
 | Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types |
 | Migration drift | `alembic check` | ✅ No new upgrade operations detected |
@@ -140,6 +171,24 @@ schema, and it makes the audit trail genuinely immutable. Two tests now cover it
 
 Nothing found this by inspection. It surfaced because the relationship tests
 issue Core deletes and let the database decide.
+
+### Three more the security tests caught
+
+* **Routes read the wrong settings.** Route dependencies called `get_settings()`
+  directly, which returns the process-wide cache — so an app built by
+  `create_app(settings)` could answer according to a *different* configuration.
+  Harmless in production where they coincide; wrong in tests, and a real hazard
+  for any multi-configuration process. Routes now take settings off
+  `app.state` via `get_app_settings`, which makes disagreement impossible.
+* **`X-Forwarded-For` could 500 a request.** The header is caller-supplied text
+  and was written straight into an `INET` column, so `X-Forwarded-For: nonsense`
+  would fail the INSERT and turn an ordinary request into a 500 — trivially
+  triggerable from outside. The value is now parsed with `ipaddress` at the
+  boundary and discarded if it is not a real address.
+* **`savepoint()` skipped its own recovery.** It guarded the rollback on
+  `nested.is_active`, but a failed flush leaves the nested transaction
+  *inactive* — precisely when the rollback is needed. The enclosing transaction
+  then died with `PendingRollbackError`. The guard is gone.
 
 ---
 
@@ -213,11 +262,21 @@ sync (`updated_since`) is supported; and whether the API exposes UPC/GTIN and
 Amazon SKU/ASIN. The `nineyard_sync_runs.cursor` column exists on the assumption
 that incremental sync may be possible; if it is not, the column is harmless.
 
-### B2 — Users, roles, and authentication *(blocks phases 8 and 10)*
-`users`, `roles`, and `user_roles` are built with tenant-scoped roles and a
-nullable `password_hash`. Confirm whether local email/password with
-admin/reviewer/viewer is right, or whether an existing identity provider is in
-play. Approval gating and audit attribution both depend on it.
+### B2 — Users, roles, and authentication *(narrowed; now blocks only phase 10)*
+**No longer blocks phase 8.** `Principal` supplies actor identity, the four
+roles are defined and seeded, and `require_roles` is ready to guard mutation
+endpoints, so the exception workflow can be built now.
+
+Two decisions remain, both about Entra ID rather than about whether to use it:
+
+1. **Is Entra authoritative for roles?** If yes, `user_roles` becomes a cache of
+   Entra app roles and the local grant path is removed rather than left as a
+   second source of truth. If no, Entra authenticates and this system authorizes.
+2. **Provisioning:** just-in-time user creation on first sign-in (simplest), or
+   SCIM (correct if deprovisioning must be prompt).
+
+Confirmation that Entra ID is in fact the target would also be useful — see
+assumption A21. Phase 10 needs a sign-in flow, which needs both answers.
 
 ### B3 — Pack size and unit-of-measure policy *(now shapes a built table)*
 `vendor_import_profiles.pack_size_handling` is JSONB and currently empty.
@@ -252,11 +311,14 @@ A1–A17 carry forward from earlier phases, with these changes:
 
 | # | Change |
 |---|---|
+| **A6** | **Superseded.** The roles are `ADMIN`, `PURCHASING_MANAGER`, `DATA_OPERATOR`, `VIEWER` — not admin/reviewer/viewer. There is no local password login: the development backend issues tokens without credentials, and Entra ID will own authentication ([security.md §4](security.md)). |
 | **A8** | **Superseded.** Single-tenancy no longer holds: the schema is organization-scoped throughout ([ADR 0009](decisions/0009-organization-scoped-multi-tenancy.md)). |
 | **A15** | Confirmed for now — `import_files.storage_uri` is backend-agnostic, so local filesystem today and S3 later needs no schema change. |
 | **A18** *(new)* | Approved mappings live on the owning row rather than in a separate mapping table, so full mapping *history* is reconstructed from `audit_events`. If that becomes a common query, a dedicated history table is the follow-up ([ADR 0010](decisions/0010-identifier-model-and-mapping-placement.md)). |
 | **A19** *(new)* | Tenant isolation relies on repository-layer discipline plus tests. PostgreSQL row-level security is not enabled; it should be evaluated before the first real multi-tenant deployment, since a forgotten `organization_id` filter is a cross-tenant leak the schema alone cannot prevent. |
-| **A20** *(new)* | `pg_trgm` is available in every target environment. It ships with PostgreSQL contrib and is present in both `postgres:16-alpine` and the EDB Windows build. |
+| **A20** | `pg_trgm` is available in every target environment. It ships with PostgreSQL contrib and is present in both `postgres:16-alpine` and the EDB Windows build. |
+| **A21** *(new)* | Microsoft Entra ID is the intended production identity provider. The `AuthenticationBackend` protocol is shaped for it; if a different provider is chosen, the protocol still holds but the JWKS/RS256 assumptions in `EntraIdAuthenticationBackend` would change. |
+| **A22** *(new)* | The service sits behind a proxy that sets `X-Forwarded-For`. Exposed directly, that header is caller-supplied and the recorded client address is worth nothing (the value is validated, so a bad one is simply dropped). |
 
 The full A1–A17 list is unchanged from the 2026-09-07 revision and remains in
 force.
@@ -265,11 +327,13 @@ force.
 
 ## 9. Recommended next step
 
-Finish phase 1 by building the **transactional audit writer service** described
-in [ADR 0006](decisions/0006-transactional-audit-logging.md): a single service
-that writes `audit_events` inside the same transaction as the change it
-describes, with before/after diff capture and `request_id` propagation from the
-existing middleware. The table, its constraints, and the append-only guarantee
-are in place; the writer is what makes them usable.
+**Phase 2 — the vendor database.** It is fully unblocked and is the natural
+first consumer of everything phase 1 built: CRUD under `/api/v1/vendors`, guarded
+by `require_roles(RoleCode.DATA_OPERATOR)`, with each mutation wrapped in
+`transaction()` alongside an `audit.record_change()` call. That exercises the
+audit writer, the transaction utilities, the role guard, and the error envelope
+against real endpoints, which is the honest test of whether the foundation is
+usable rather than merely present.
 
-Phase 2 (vendor CRUD) is the natural first consumer and is otherwise unblocked.
+Phase 4 (import profiles) follows, though its JSONB rule shapes still want real
+vendor files (B4).

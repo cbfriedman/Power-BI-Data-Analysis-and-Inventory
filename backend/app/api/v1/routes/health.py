@@ -11,8 +11,9 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_app_settings
 from app.core.clock import utc_now
-from app.core.config import Settings, get_settings
+from app.core.config import Settings
 from app.db.session import get_db
 from app.schemas.health import DependencyHealth, ReadinessResponse
 from app.services import health as health_service
@@ -29,7 +30,7 @@ router = APIRouter(tags=["health"])
 def readiness(
     response: Response,
     session: Session = Depends(get_db),
-    settings: Settings = Depends(get_settings),
+    settings: Settings = Depends(get_app_settings),
 ) -> ReadinessResponse:
     """Report whether the API and its dependencies are ready to serve."""
     result = health_service.check_readiness(session)

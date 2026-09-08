@@ -13,8 +13,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
+from app.api.deps import get_app_settings
 from app.core.clock import utc_now
-from app.core.config import Settings, get_settings
+from app.core.config import Settings
 from app.schemas.health import LivenessResponse
 
 router = APIRouter(tags=["health"])
@@ -25,6 +26,6 @@ router = APIRouter(tags=["health"])
     response_model=LivenessResponse,
     summary="Liveness probe",
 )
-def liveness(settings: Settings = Depends(get_settings)) -> LivenessResponse:
+def liveness(settings: Settings = Depends(get_app_settings)) -> LivenessResponse:
     """Return 200 whenever the process is running."""
     return LivenessResponse(service=settings.app_name, checked_at=utc_now())

@@ -59,7 +59,12 @@ def test_openapi_schema_is_served(client: TestClient) -> None:
     response = client.get("/api/v1/openapi.json")
 
     assert response.status_code == 200
-    assert set(response.json()["paths"]) == {"/health", "/api/v1/health"}
+    assert set(response.json()["paths"]) == {
+        "/health",
+        "/api/v1/health",
+        "/api/v1/auth/me",
+        "/api/v1/auth/dev-token",
+    }
 
 
 def test_both_required_health_endpoints_exist(app: FastAPI) -> None:

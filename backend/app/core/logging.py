@@ -3,8 +3,14 @@
 Application logs and the logs emitted by uvicorn and SQLAlchemy are routed
 through one structlog pipeline so every line is a single JSON object with
 consistent keys. A ``request_id`` bound via context variables is attached
-automatically, which is what correlates an HTTP request to its log lines and,
-once audit logging lands in phase 1, to its audit rows (CLAUDE.md §6).
+automatically, which is what correlates an HTTP request to its log lines and to
+its audit rows (CLAUDE.md §6).
+
+Every event passes through :mod:`app.core.redaction` before rendering, on both
+the structlog path and the stdlib path used by third-party libraries. Redaction
+sits at the sink because credentials reach logs by accident — a header dump, an
+exception repr, a driver logging its DSN — and no discipline at the call sites
+catches all of those.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ import structlog
 from structlog.types import Processor
 
 from app.core.config import Settings
+from app.core.redaction import redaction_processor
 
 _STDLIB_LOGGERS_TO_TAME = ("uvicorn", "uvicorn.error", "uvicorn.access", "sqlalchemy.engine")
 
@@ -47,6 +54,9 @@ def configure_logging(settings: Settings) -> None:
         processors=[
             *shared_processors,
             structlog.processors.format_exc_info,
+            # Last before hand-off to the formatter, so it sees the fully
+            # assembled event including anything merged in from contextvars.
+            redaction_processor,
             structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
         logger_factory=structlog.stdlib.LoggerFactory(),
@@ -58,6 +68,11 @@ def configure_logging(settings: Settings) -> None:
         foreign_pre_chain=shared_processors,
         processors=[
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            # Applied again here because log records from third-party libraries
+            # enter through foreign_pre_chain and never pass through the
+            # structlog processor chain above. A library logging a connection
+            # string is exactly the leak this catches.
+            redaction_processor,
             renderer,
         ],
     )

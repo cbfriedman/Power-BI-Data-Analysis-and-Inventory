@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy.exc import OperationalError
 
 from app.core.config import Settings, get_settings
@@ -50,7 +51,9 @@ def settings() -> Settings:
         app_name="prms-api-test",
         log_level="WARNING",
         log_format="json",
-        database_url="postgresql+psycopg://test:test@localhost:5432/test",
+        database_url=SecretStr("postgresql+psycopg://test:test@localhost:5432/test"),
+        auth_jwt_secret=SecretStr("unit-test-signing-key-not-used-anywhere-for-real"),
+        dev_auth_enabled=True,
         cors_allow_origins=["http://localhost:3000"],
     )
 

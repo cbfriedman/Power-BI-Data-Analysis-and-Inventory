@@ -8,8 +8,44 @@
 *.key
 *.p12
 *.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
 secrets/
 credentials.json
+service-account*.json
+
+# Token and credential caches. MSAL writes one of these once Microsoft Entra ID
+# is introduced; the cloud CLIs write the rest. All contain live credentials.
+*.token
+*.token.json
+token_cache*.json
+.msal_cache*
+.azure/
+.aws/
+.secrets/
+*.netrc
+.netrc
+
+# ---------------------------------------------------------------------------
+# Imported client data. Vendor inventory files, catalog extracts and exports are
+# commercially sensitive and are business data, not source code. Blocked by
+# extension so a file dropped into the repo to "try something" cannot be
+# committed by accident; test fixtures are allowed back in explicitly.
+# ---------------------------------------------------------------------------
+*.csv
+*.xlsx
+*.xls
+*.xlsm
+*.pbix
+data/
+exports/
+extracts/
+!backend/tests/**/fixtures/**
+!backend/tests/fixtures/**
+!**/fixtures/**/*.csv
+!**/fixtures/**/*.xlsx
 
 # ---------------------------------------------------------------------------
 # Retained import files. Raw files are business data, not source code, and may

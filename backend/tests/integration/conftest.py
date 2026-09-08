@@ -46,7 +46,8 @@ def resolve_test_database_url() -> URL:
     if explicit:
         return make_url(explicit)
 
-    base = make_url(os.environ.get("DATABASE_URL") or get_settings().database_url)
+    configured = os.environ.get("DATABASE_URL") or get_settings().database_url.get_secret_value()
+    base = make_url(configured)
     database = base.database or "prms"
     if database.endswith(TEST_DATABASE_SUFFIX):
         return base
