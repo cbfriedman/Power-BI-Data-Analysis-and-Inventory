@@ -6,7 +6,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Purchasing & Replenishment Management System",
-  description: "Milestone 1 — catalog, vendors, inventory imports, product matching.",
+  description: "Vendor catalogue, inventory imports, and product matching.",
 };
 
 export default function RootLayout({

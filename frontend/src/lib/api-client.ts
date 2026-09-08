@@ -1,8 +1,8 @@
 /**
  * Minimal API client.
  *
- * Deliberately small at scaffold stage. Once endpoints exist, the response
- * types here are replaced by types generated from the FastAPI OpenAPI schema
+ * Deliberately small for now. As endpoints are added, the response types here
+ * are replaced by types generated from the FastAPI OpenAPI schema
  * (`openapi-typescript`), so the contract has one source of truth.
  */
 

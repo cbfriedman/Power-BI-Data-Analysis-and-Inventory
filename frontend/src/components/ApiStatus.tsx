@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 
+import { DatabaseIcon, PlugIcon } from "@/components/icons";
 import { fetchReadiness, type ReadinessResponse } from "@/lib/api-client";
 import { apiBaseUrl } from "@/lib/config";
 
@@ -11,60 +12,145 @@ type State =
   | { kind: "unreachable" };
 
 /**
- * Live API status indicator.
+ * Polls the readiness probe.
  *
- * Doubles as a check that the environment-based API URL is wired correctly:
- * if NEXT_PUBLIC_API_BASE_URL is wrong, this says so immediately.
+ * Shared by the sidebar badge and the dashboard card so the two can never
+ * disagree about whether the backend is up.
  */
-export function ApiStatus() {
+function useReadiness(pollMs = 30_000): State {
   const [state, setState] = useState<State>({ kind: "loading" });
 
   useEffect(() => {
     const controller = new AbortController();
+    let cancelled = false;
 
-    fetchReadiness(controller.signal)
-      .then((readiness) => setState({ kind: "loaded", readiness }))
-      .catch((error: unknown) => {
+    async function check() {
+      try {
+        const readiness = await fetchReadiness(controller.signal);
+        if (!cancelled) setState({ kind: "loaded", readiness });
+      } catch (error: unknown) {
         if (error instanceof DOMException && error.name === "AbortError") return;
-        setState({ kind: "unreachable" });
-      });
+        if (!cancelled) setState({ kind: "unreachable" });
+      }
+    }
 
-    return () => controller.abort();
-  }, []);
+    void check();
+    const timer = window.setInterval(() => void check(), pollMs);
 
-  if (state.kind === "loading") {
-    return (
-      <p className="status status--pending">
-        <span className="status__dot" /> Checking API…
-      </p>
-    );
-  }
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [pollMs]);
 
-  if (state.kind === "unreachable") {
-    return (
-      <p className="status status--error">
-        <span className="status__dot" /> API unreachable at <code>{apiBaseUrl}</code>
-      </p>
-    );
-  }
+  return state;
+}
 
-  const { readiness } = state;
-  const healthy = readiness.status === "ok";
+/** Compact indicator for the sidebar footer. */
+export function SidebarStatus() {
+  const state = useReadiness();
+
+  const tone =
+    state.kind === "loading"
+      ? { className: "", label: "Checking…" }
+      : state.kind === "unreachable"
+        ? { className: "badge--danger", label: "Offline" }
+        : state.readiness.status === "ok"
+          ? { className: "badge--ok", label: "Operational" }
+          : { className: "badge--warn", label: "Degraded" };
 
   return (
-    <div className={`status ${healthy ? "status--ok" : "status--warn"}`}>
-      <p>
-        <span className="status__dot" /> API <strong>{readiness.status}</strong> · {readiness.service}{" "}
-        · env <code>{readiness.environment}</code>
-      </p>
-      <ul className="status__deps">
-        {readiness.dependencies.map((dependency) => (
-          <li key={dependency.name}>
-            {dependency.name}: <strong>{dependency.status}</strong>
-            {dependency.detail ? ` — ${dependency.detail}` : ""}
-          </li>
-        ))}
-      </ul>
+    <div className="status-mini">
+      <span className={`badge ${tone.className}`}>
+        <span className={`dot${state.kind === "loading" ? " dot--pulse" : ""}`} />
+        {tone.label}
+      </span>
+      <span className="status-mini__label">System</span>
+    </div>
+  );
+}
+
+/** Full status card for the dashboard. */
+export function SystemStatusCard() {
+  const state = useReadiness();
+
+  return (
+    <div className="card">
+      <div className="card__header">
+        <span className="card__title">
+          <PlugIcon />
+          System status
+        </span>
+        {state.kind === "loaded" ? (
+          <span
+            className={`badge ${state.readiness.status === "ok" ? "badge--ok" : "badge--warn"}`}
+          >
+            <span className="dot" />
+            {state.readiness.status === "ok" ? "All systems operational" : "Degraded"}
+          </span>
+        ) : state.kind === "unreachable" ? (
+          <span className="badge badge--danger">
+            <span className="dot" />
+            Unreachable
+          </span>
+        ) : (
+          <span className="badge">
+            <span className="dot dot--pulse" />
+            Checking…
+          </span>
+        )}
+      </div>
+
+      <div className="kv">
+        <div className="kv__row">
+          <span className="kv__key">
+            <PlugIcon style={{ width: 15, height: 15 }} />
+            API service
+          </span>
+          <span className="kv__value">
+            {state.kind === "loaded"
+              ? state.readiness.service
+              : state.kind === "unreachable"
+                ? "Not responding"
+                : "—"}
+          </span>
+        </div>
+
+        <div className="kv__row">
+          <span className="kv__key">
+            <DatabaseIcon style={{ width: 15, height: 15 }} />
+            Database
+          </span>
+          <span className="kv__value">
+            {state.kind === "loaded"
+              ? (state.readiness.dependencies.find((d) => d.name === "postgresql")?.status ??
+                "unknown")
+              : "—"}
+          </span>
+        </div>
+
+        <div className="kv__row">
+          <span className="kv__key">Environment</span>
+          <span className="kv__value">
+            {state.kind === "loaded" ? state.readiness.environment : "—"}
+          </span>
+        </div>
+
+        <div className="kv__row">
+          <span className="kv__key">Endpoint</span>
+          <span className="kv__value">
+            <code>{apiBaseUrl}</code>
+          </span>
+        </div>
+      </div>
+
+      {state.kind === "unreachable" ? (
+        <p className="card__note">
+          The interface cannot reach the API at <code>{apiBaseUrl}</code>. Check that the
+          backend is running and that <code>NEXT_PUBLIC_API_BASE_URL</code> points at it.
+        </p>
+      ) : null}
     </div>
   );
 }

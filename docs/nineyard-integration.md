@@ -61,16 +61,62 @@ Protected requests use `Authorization: Bearer <accessToken>`.
 | Vendors | `GET /api/Vendors` |
 | PurchaseOrders | `GET /api/PurchaseOrders` |
 
-### What is not known
+### The published OpenAPI specification
 
-Response envelope shape · field names and types · nullability · paging mechanism
-and parameter names · total-count semantics · rate limits · whether the
-integration account can read every group · the relationship between Items and
-Skus · which field is the **Catalog Item Number** that CLAUDE.md §5 makes the
-primary business reference.
+**Discovered 2026-09-08:** the full spec is publicly readable, no credentials
+required, at
 
-That last one is the single most important unknown. The entire product-identity
-model depends on it.
+```
+https://backyard.nineyard.com/swagger/v1/swagger.json
+```
+
+`Nineyard.Rest.Api` v2.0, OpenAPI 3.0.1 — 65 paths and 117 schemas. A copy is
+saved at `storage/diagnostics/nineyard/swagger-v1.json` (git-ignored).
+
+Note that `https://backyard.nineyard.com/` is the **API and its documentation**,
+not the Nineyard application UI. There is no login there; account credentials
+come from the Nineyard application the business actually uses.
+
+The spec answers most of what was previously unknown — envelope shapes, field
+names, types, nullability, and paging. Those findings are recorded in
+[nineyard-field-mapping.md](nineyard-field-mapping.md), marked `DOCUMENTED`
+rather than `CONFIRMED`, because a spec describes a contract and only a probe run
+describes behaviour.
+
+### What the specification does not answer
+
+Only `200` responses are documented, so **every error shape is unknown**. Nor can
+it say which endpoints *this account* may read, what the real `Content-Type`
+headers are, the default page size, or whether `GET /api/Items` returns the whole
+catalog or only QuickBooks-relevant rows.
+
+Three questions need a person at Nineyard, not a probe:
+
+1. **There is no `catalogItemNumber` field anywhere in the API.** The only
+   candidate for the primary business reference CLAUDE.md §5 requires is
+   `itemId`, an internal surrogate key. This is now the single most important
+   open question.
+2. The Items↔Skus relationship is **many-to-many with a quantity** — bundles and
+   multi-packs — which `marketplace_listings` cannot represent as designed.
+3. Four inventory quantities exist (`qtyOnHand`, `localstock`, `inboundStock`,
+   `totalStock`) with no documented definitions. Availability detection depends
+   on choosing correctly.
+
+### A safety finding from the specification
+
+The API has **45 write endpoints** against 27 reads, several sharing a path
+prefix with the ones we read:
+
+```
+POST /api/Items/UpdateInventory      POST /api/Items/IncreaseInventory
+POST /api/Items/DecreaseInventory    POST /api/Items/LocalStockRecalc
+POST /api/Skus                       POST /api/Shipping/RemoveShipmentByCompanyId
+POST /api/ShipmentBoxes/DeleteBoxFromShipment
+```
+
+`GET /api/Items` and `POST /api/Items/UpdateInventory` differ by a path suffix.
+The read-only-by-construction design in §3 is therefore load-bearing rather than
+decorative: the client has no method capable of issuing any of these.
 
 ---
 
