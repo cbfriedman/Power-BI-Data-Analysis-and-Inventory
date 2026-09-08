@@ -68,6 +68,10 @@ _SAFE_KEY_EXCEPTIONS: Final[frozenset[str]] = frozenset(
         "expires_in",
         "has_token",
         "token_count",
+        # A truncated hash of a token, deliberately logged so two runs can be
+        # told apart. It is not a credential and cannot be reversed into one —
+        # redacting it would leave the fingerprint with no purpose.
+        "token_fingerprint",
     }
 )
 

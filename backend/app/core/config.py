@@ -87,11 +87,26 @@ class Settings(BaseSettings):
     # client. Never enabled in production: forced off by the validator below.
     expose_error_details: bool = False
 
-    # --- Integrations --------------------------------------------------------
-    # Unset until blocking question B1 is answered. Typed now so it can never be
-    # introduced as a plain string later.
-    nineyard_api_key: SecretStr | None = None
-    nineyard_base_url: str | None = None
+    # --- Nineyard integration ------------------------------------------------
+    # The authentication shape is observed, not assumed: Nineyard issues a bearer
+    # token in exchange for an email/password/companyId triple, so there is no
+    # API key. Credentials are unset by default; the diagnostic tool refuses to
+    # run without them rather than inventing a fallback.
+    nineyard_base_url: str = "https://backyard.nineyard.com"
+    nineyard_email: str | None = None
+    nineyard_password: SecretStr | None = None
+    nineyard_company_id: int | None = None
+    nineyard_timeout_seconds: float = 30.0
+    # Applies to transient failures only — see integrations/nineyard/client.py.
+    nineyard_max_attempts: int = 3
+
+    @property
+    def has_nineyard_credentials(self) -> bool:
+        return (
+            self.nineyard_email is not None
+            and self.nineyard_password is not None
+            and self.nineyard_company_id is not None
+        )
 
     # --- HTTP ----------------------------------------------------------------
     # NoDecode stops pydantic-settings from JSON-decoding the environment value

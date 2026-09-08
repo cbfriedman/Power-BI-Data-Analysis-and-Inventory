@@ -175,3 +175,21 @@ class TestLoggingPipeline:
         out = capsys.readouterr().out
         assert "leaked-password" not in out
         assert REDACTED in out
+
+
+class TestTokenFingerprintAllowlist:
+    """A fingerprint is designed to be logged; redacting it defeats its purpose."""
+
+    def test_a_token_fingerprint_survives_redaction(self) -> None:
+        event = {"token_fingerprint": "abc123def456", "event": "nineyard.authenticated"}
+
+        assert redact_mapping(event)["token_fingerprint"] == "abc123def456"
+
+    def test_but_an_actual_token_is_still_redacted(self) -> None:
+        """The allowlist is narrow: the neighbouring key is not exempted."""
+        event = {"token_fingerprint": "abc123", "access_token": "the-real-thing"}
+
+        redacted = redact_mapping(event)
+
+        assert redacted["token_fingerprint"] == "abc123"
+        assert redacted["access_token"] == REDACTED

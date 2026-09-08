@@ -16,7 +16,7 @@ from app.core.config import INSECURE_DEV_JWT_SECRET, Settings
 
 DB_PASSWORD = "d0-not-leak-this-db-password"
 JWT_SECRET = "d0-not-leak-this-signing-key-which-is-long-enough"
-API_KEY = "d0-not-leak-this-api-key"
+NINEYARD_PASSWORD = "d0-not-leak-this-nineyard-password"
 
 
 @pytest.fixture
@@ -25,11 +25,11 @@ def settings() -> Settings:
         app_env="test",
         database_url=SecretStr(f"postgresql+psycopg://prms:{DB_PASSWORD}@localhost:5432/prms"),
         auth_jwt_secret=SecretStr(JWT_SECRET),
-        nineyard_api_key=SecretStr(API_KEY),
+        nineyard_password=SecretStr(NINEYARD_PASSWORD),
     )
 
 
-ALL_SECRETS = (DB_PASSWORD, JWT_SECRET, API_KEY)
+ALL_SECRETS = (DB_PASSWORD, JWT_SECRET, NINEYARD_PASSWORD)
 
 
 def test_repr_does_not_leak_secrets(settings: Settings) -> None:
@@ -74,13 +74,13 @@ def test_secret_values_are_still_reachable_deliberately(settings: Settings) -> N
     """Masking must not make the value unusable — only inconvenient to leak."""
     assert DB_PASSWORD in settings.database_url.get_secret_value()
     assert settings.auth_jwt_secret.get_secret_value() == JWT_SECRET
-    assert settings.nineyard_api_key is not None
-    assert settings.nineyard_api_key.get_secret_value() == API_KEY
+    assert settings.nineyard_password is not None
+    assert settings.nineyard_password.get_secret_value() == NINEYARD_PASSWORD
 
 
 def test_credentials_are_typed_as_secrets() -> None:
     """A tripwire: adding a credential as a plain str should fail this."""
-    for field_name in ("database_url", "auth_jwt_secret", "nineyard_api_key"):
+    for field_name in ("database_url", "auth_jwt_secret", "nineyard_password"):
         annotation = Settings.model_fields[field_name].annotation
         assert annotation is not None
         assert "SecretStr" in str(annotation), f"{field_name} is not a SecretStr"

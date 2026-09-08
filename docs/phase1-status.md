@@ -17,7 +17,7 @@ Last updated: 2026-09-08 (security foundation)
 | Backend tests | 210, all passing (104 unit, 106 database-backed) |
 | Quality gates | 8 of 8 passing locally (§4) |
 | Docker stack | **Still unverified** — see §6, issue S1 |
-| Blocking questions open | 7 (see §7); B2 narrowed to two decisions |
+| Blocking questions open | 7 (see §7); B1 partially answered, B2 narrowed |
 
 The schema, the audit writer, and the security foundation exist and are
 verified. Nothing yet reads a vendor file, calls Nineyard, or matches a product.
@@ -34,7 +34,7 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates |
 | 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
 | 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
-| 3 | Nineyard integration + sync | 🚫 Blocked | Blocked by B1 — no API specification. `nineyard_sync_runs` and `source_records` tables exist; no client. |
+| 3 | Nineyard integration + sync | 🟨 Partially unblocked | Auth endpoint and four read-only paths are known. A **read-only diagnostic** exists ([nineyard-integration.md](nineyard-integration.md)); the sync client waits on probe findings — see B1. |
 | 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
 | 5 | File ingestion + raw retention | ⬜ Not started | `import_files` exists; no `StorageBackend` yet |
 | 6 | Parsing + validation + reporting | ⬜ Not started | Needs sample files (B4) |
@@ -254,13 +254,33 @@ Unchanged. B1 and B2 gate implementation work; the rest shape it. B3 and B4 have
 become more pressing now that `vendor_import_profiles` exists and its JSONB rule
 columns need real shapes.
 
-### B1 — Nineyard API specification *(blocks phase 3 entirely)*
-API documentation and base URL; authentication model and how credentials are
-issued; sandbox availability; rate limits; pagination style; a sample catalog
-item payload identifying the exact **Catalog Item Number** field; whether delta
-sync (`updated_since`) is supported; and whether the API exposes UPC/GTIN and
-Amazon SKU/ASIN. The `nineyard_sync_runs.cursor` column exists on the assumption
-that incremental sync may be possible; if it is not, the column is harmless.
+### B1 — Nineyard API specification *(partially answered)*
+
+**Answered:** the base URL, the authentication endpoint
+(`POST /api/OAuth/UsernameToken`), its request body (`email`, `password`,
+`companyId`), the bearer-token scheme, and four read-only endpoint groups —
+`/api/Items`, `/api/Skus`, `/api/Vendors`, `/api/PurchaseOrders`.
+
+The `nineyard_api_key` setting has been removed accordingly: the real
+authentication is a credential triple, not an API key.
+
+**Still unknown, and now answerable by running the probe rather than by asking:**
+response envelope shape, field names and types, nullability, paging mechanism and
+parameter names, rate limits, and which groups the integration account can
+actually read. `docs/nineyard-field-mapping.md` tracks each one.
+
+**Still needs a person at Nineyard**, because no single probe run can establish
+it:
+
+1. Which field is the **Catalog Item Number**, and is it stable across syncs?
+   The whole product-identity model rests on this.
+2. What is the relationship between Items and Skus? It decides how three tables
+   are populated.
+3. Is incremental sync supported (an `updatedSince` filter)? If not, full pulls
+   are the only option and `nineyard_sync_runs.cursor` stays unused.
+4. How are deletions represented — absence from the collection, or a flag?
+   Getting this wrong silently deactivates live products.
+5. Are there published rate limits?
 
 ### B2 — Users, roles, and authentication *(narrowed; now blocks only phase 10)*
 **No longer blocks phase 8.** `Principal` supplies actor identity, the four
