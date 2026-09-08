@@ -1,0 +1,103 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prms-backend"
+version = "0.1.0"
+description = "Purchasing & Replenishment Management System — backend API"
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy>=2.0.36",
+    "alembic>=1.14",
+    "psycopg[binary]>=3.2",
+    "structlog>=24.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "httpx2>=2.12",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+# -----------------------------------------------------------------------------
+# Ruff — linting and formatting
+# -----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "TID", # flake8-tidy-imports
+    "PTH", # flake8-use-pathlib
+    "RUF", # ruff-specific
+]
+ignore = [
+    "B008", # FastAPI's Depends() in defaults is the documented idiom
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+"alembic/**" = ["I001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+# -----------------------------------------------------------------------------
+# mypy — static type checking
+# -----------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+files = ["app", "tests"]
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+show_error_codes = true
+pretty = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["alembic.*"]
+ignore_missing_imports = true
+
+# -----------------------------------------------------------------------------
+# pytest
+# -----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "integration: requires a live PostgreSQL database",
+]
+# Warnings are errors, so our own deprecations surface immediately. Third-party
+# deprecations we cannot fix are ignored individually rather than by relaxing
+# the default — each one is a line we delete when upstream catches up.
+filterwarnings = [
+    "error",
+    # Raised inside starlette.testclient on import. Fixed upstream in starlette,
+    # not in the release we pin.
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
+]

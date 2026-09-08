@@ -1,0 +1,103 @@
+# =============================================================================
+# Local development stack.
+#
+# Run from the repository root:
+#   docker compose --env-file .env -f infra/docker-compose.yml up --build
+#
+# Every value is interpolated from the environment with a development default,
+# so `docker compose config` validates even before you create a .env. No secret
+# is ever written into this file (CLAUDE.md §4).
+# =============================================================================
+name: prms
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: prms-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-prms}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_dev_only_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-prms}
+      # Deterministic collation, so ORDER BY does not vary with the host locale.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-prms} -d ${POSTGRES_DB:-prms}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      args:
+        # Dev tooling in the image, so ruff/mypy/pytest can run without a host
+        # Python installation.
+        INSTALL_DEV: "true"
+    container_name: prms-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      APP_NAME: ${APP_NAME:-prms-api}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      DATABASE_URL: >-
+        postgresql+psycopg://${POSTGRES_USER:-prms}:${POSTGRES_PASSWORD:-local_dev_only_change_me}@postgres:5432/${POSTGRES_DB:-prms}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:3000}
+      STORAGE_RAW_DIR: /storage/raw
+      STORAGE_PROCESSED_DIR: /storage/processed
+      STORAGE_REJECTED_DIR: /storage/rejected
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    volumes:
+      # Retained import files live on the host so they survive `down -v`
+      # (ADR 0004).
+      - ../storage:/storage
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import sys, urllib.request;
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  web:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the browser bundle at build time — must be the URL the
+        # BROWSER uses, not the in-network service name.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    container_name: prms-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_HOST_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  pgdata:
+    name: prms_pgdata
