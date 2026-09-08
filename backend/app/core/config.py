@@ -139,6 +139,34 @@ class Settings(BaseSettings):
             return [item.strip() for item in stripped.split(",") if item.strip()]
         return value
 
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def _normalise_database_scheme(cls, value: object) -> object:
+        """Accept the DSN shape managed platforms actually hand out.
+
+        Railway, Render, Heroku and friends inject ``postgres://`` or
+        ``postgresql://``. SQLAlchemy reads the scheme to pick a driver, and
+        without an explicit ``+psycopg`` it reaches for psycopg2, which is not
+        installed — so the app dies at first connection with a confusing
+        ModuleNotFoundError rather than anything about configuration.
+
+        Rewriting the scheme here means the platform's variable can be used
+        as-is, with no manual re-assembly of the DSN per environment.
+        """
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if not isinstance(raw, str):
+            return value
+
+        for prefix in ("postgresql+", "postgres+"):
+            if raw.startswith(prefix):
+                return value  # A driver is already named; leave it alone.
+
+        for prefix in ("postgresql://", "postgres://"):
+            if raw.startswith(prefix):
+                return SecretStr("postgresql+psycopg://" + raw[len(prefix) :])
+
+        return value
+
     @field_validator("log_level", mode="before")
     @classmethod
     def _normalize_log_level(cls, value: object) -> object:

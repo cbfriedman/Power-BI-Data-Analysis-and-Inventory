@@ -60,3 +60,40 @@ def test_no_credential_is_hardcoded_as_a_working_default() -> None:
 
     assert isinstance(default_url, SecretStr)
     assert "localhost" in default_url.get_secret_value()
+
+
+class TestDatabaseUrlNormalisation:
+    """Managed platforms inject a DSN without a driver name.
+
+    Railway, Render and Heroku all hand out `postgres://` or `postgresql://`.
+    SQLAlchemy picks its driver from the scheme, so without `+psycopg` it
+    reaches for psycopg2 — which is not installed — and the app dies at first
+    connection with a ModuleNotFoundError that says nothing about config.
+    """
+
+    @pytest.mark.parametrize(
+        "injected",
+        ["postgres://u:p@host:5432/db", "postgresql://u:p@host:5432/db"],
+    )
+    def test_a_driverless_scheme_gains_psycopg(self, injected: str) -> None:
+        settings = Settings(database_url=injected)
+
+        assert settings.database_url.get_secret_value() == "postgresql+psycopg://u:p@host:5432/db"
+
+    def test_an_explicit_driver_is_left_alone(self) -> None:
+        explicit = "postgresql+asyncpg://u:p@host:5432/db"
+
+        settings = Settings(database_url=explicit)
+
+        assert settings.database_url.get_secret_value() == explicit
+
+    def test_the_password_is_still_masked_after_rewriting(self) -> None:
+        settings = Settings(database_url="postgres://u:sup3rs3cret@host:5432/db")
+
+        assert "sup3rs3cret" not in repr(settings)
+        assert "sup3rs3cret" in settings.database_url.get_secret_value()
+
+    def test_a_non_postgres_url_is_untouched(self) -> None:
+        settings = Settings(database_url="sqlite:///./local.db")
+
+        assert settings.database_url.get_secret_value() == "sqlite:///./local.db"

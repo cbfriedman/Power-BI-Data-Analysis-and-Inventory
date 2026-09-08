@@ -4,7 +4,15 @@
 FROM node:24-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
+# Retries and a generous timeout: a dropped connection part-way through
+# an install is the most common way a container build fails on a flaky
+# network or a busy CI runner, and the default single attempt turns that
+# into a hard failure.
+RUN npm ci --no-audit --no-fund \
+    --fetch-retries=5 \
+    --fetch-retry-mintimeout=20000 \
+    --fetch-retry-maxtimeout=180000 \
+    --fetch-timeout=600000
 
 FROM node:24-alpine AS builder
 WORKDIR /app

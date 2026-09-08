@@ -47,9 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Purchasing & Replenishment Management System",
-        description=(
-            "Vendor catalogue, inventory imports, and deterministic product matching."
-        ),
+        description=("Vendor catalogue, inventory imports, and deterministic product matching."),
         version="0.1.0",
         openapi_url=f"{settings.api_v1_prefix}/openapi.json",
         docs_url=f"{settings.api_v1_prefix}/docs",
