@@ -340,6 +340,19 @@ proves too slow on large vendor files. Not adopted up front.
 
 ## 5. Database entity list
 
+> **Superseded as of 2026-09-08.** The schema is implemented, and
+> [docs/database-schema.md](database-schema.md) is now the authoritative
+> description — it documents the 21 tables as built, with the ER diagram,
+> relationship and delete-behaviour reference, and index coverage.
+>
+> The section below is the original planning sketch, kept for the reasoning it
+> records. It differs from what shipped in three ways: table names are plural
+> (`products`, not `product`); tenancy was added, so every table carries
+> `organization_id` ([ADR 0009](decisions/0009-organization-scoped-multi-tenancy.md));
+> and approved mappings live on `vendor_products` and `marketplace_listings`
+> rather than in a separate mapping table
+> ([ADR 0010](decisions/0010-identifier-model-and-mapping-placement.md)).
+
 All tables carry a UUID primary key (`id`) and `created_at` / `updated_at` as
 `TIMESTAMPTZ` in UTC. Business keys are separate, uniquely constrained columns.
 Foreign keys always target UUIDs.

@@ -25,5 +25,7 @@ otherwise be tempted to "fix" without knowing why it is the way it is.
 | [0006](0006-transactional-audit-logging.md) | Audit entries commit with the change they describe | Accepted |
 | [0007](0007-nineyard-anti-corruption-layer.md) | Isolate Nineyard behind an anti-corruption layer | Accepted |
 | [0008](0008-synchronous-sqlalchemy.md) | Synchronous SQLAlchemy, and no pandas in the import path | Accepted |
+| [0009](0009-organization-scoped-multi-tenancy.md) | Organization-scoped multi-tenancy from the first migration | Accepted |
+| [0010](0010-identifier-model-and-mapping-placement.md) | Identifier model, and where approved mappings live | Accepted |
 
 Statuses: `Proposed` · `Accepted` · `Superseded by NNNN` · `Deprecated`

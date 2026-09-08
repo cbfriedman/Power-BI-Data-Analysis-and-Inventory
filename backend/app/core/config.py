@@ -8,6 +8,7 @@ or committed (CLAUDE.md §4).
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
@@ -15,12 +16,22 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 LogFormat = Literal["json", "console"]
 
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = _BACKEND_ROOT.parent
+
+# Resolved absolutely, because a relative ".env" is read from the working
+# directory: running from backend/ would silently miss the repository-root file
+# and fall back to defaults. Later entries win, so a backend-local .env can
+# override the shared one. In containers there is no file at all and the values
+# arrive as real environment variables.
+_ENV_FILES = (_REPO_ROOT / ".env", _BACKEND_ROOT / ".env")
+
 
 class Settings(BaseSettings):
     """Typed application settings sourced from the environment."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_ENV_FILES,
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,

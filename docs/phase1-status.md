@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 ---
 
@@ -10,15 +10,16 @@ Last updated: 2026-09-07
 | | |
 |---|---|
 | Milestone | 1 — Data foundation, ingestion, matching |
-| Stage | **Phase 0 (scaffolding) complete. Phase 1 not started.** |
-| Application code | Backend service skeleton + frontend shell. No business logic. |
-| Database schema | None. No business tables, no migrations. |
-| Backend tests | 21, all passing |
+| Stage | **Phase 1 (database foundation) complete. Audit *table* built; audit *service* not yet written.** |
+| Application code | Backend service skeleton, full schema, frontend shell. No business logic. |
+| Database schema | 21 tables, 21 enum types, 113 indexes, 61 check constraints, 73 foreign keys, 1 append-only trigger |
+| Migrations | 1 revision, applied and reversed against PostgreSQL 16.15 |
+| Backend tests | 98, all passing (21 unit, 77 database-backed) |
 | Quality gates | 8 of 8 passing locally (§4) |
-| Docker stack | **Unverified on this machine** — see §6, issue S1 |
+| Docker stack | **Still unverified** — see §6, issue S1 |
 | Blocking questions open | 7 (see §7) |
 
-The stack builds and the API runs. Nothing yet reads a vendor file, calls
+The schema exists and is verified. Nothing yet reads a vendor file, calls
 Nineyard, matches a product, or writes an audit row.
 
 ---
@@ -29,17 +30,17 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 
 | # | Phase | Status | Notes |
 |---|---|---|---|
-| — | Planning and documentation | ✅ Complete | Scope, architecture, criteria, 8 ADRs |
+| — | Planning and documentation | ✅ Complete | Scope, architecture, criteria, 10 ADRs |
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates |
-| 1 | DB foundation + audit | ⬜ Not started | Next unblocked work |
-| 2 | Vendor database | ⬜ Not started | |
-| 3 | Nineyard integration + sync | 🚫 Blocked | Blocked by B1 — no API specification |
-| 4 | Import profiles | ⬜ Not started | Shape depends on B3 |
-| 5 | File ingestion + raw retention | ⬜ Not started | Destination depends on B5 |
+| 1 | DB foundation + audit | 🟨 In progress | Schema and migration done; `audit_events` table and trigger exist. The transactional audit *writer service* (ADR 0006) is not built. |
+| 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD |
+| 3 | Nineyard integration + sync | 🚫 Blocked | Blocked by B1 — no API specification. `nineyard_sync_runs` and `source_records` tables exist; no client. |
+| 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
+| 5 | File ingestion + raw retention | ⬜ Not started | `import_files` exists; no `StorageBackend` yet |
 | 6 | Parsing + validation + reporting | ⬜ Not started | Needs sample files (B4) |
-| 7 | Matching engine | ⬜ Not started | Rules fully specified; buildable now |
-| 8 | Exception workflow | ⬜ Not started | Needs B2 for actor identity |
-| 9 | Inventory, availability, watchlist | ⬜ Not started | |
+| 7 | Matching engine | ⬜ Not started | Schema supports the full priority chain; engine unwritten |
+| 8 | Exception workflow | ⬜ Not started | `product_mapping_exceptions` exists; needs B2 for actor identity |
+| 9 | Inventory, availability, watchlist | ⬜ Not started | All four tables exist; no diffing logic |
 | 10 | Admin interface | ⬜ Not started | Shell exists; screens are placeholders |
 | 11 | Hardening | ⬜ Not started | |
 
@@ -47,91 +48,98 @@ Legend: ✅ complete · 🟨 in progress · ⬜ not started · 🚫 blocked
 
 ---
 
-## 3. What phase 0 delivered
+## 3. What phase 1 delivered
 
-### Backend (`backend/`)
+### Schema
 
-* FastAPI application factory with a lifespan that does **not** connect to the
-  database at startup — a brief PostgreSQL outage must not stop the API booting.
-* `GET /health` — liveness. Touches no dependency, so a database outage cannot
-  cause an orchestrator to kill a healthy container.
-* `GET /api/v1/health` — readiness. Reaches PostgreSQL and returns **503
-  `degraded`** when it cannot (AC-0.5).
-* Layer separation: `api`, `core`, `db`, `models`, `schemas`, `repositories`,
-  `services`, `integrations`, `imports`, `tests`. Dependency directions are
-  documented in [architecture.md §2](architecture.md).
-* Typed settings from environment variables only, one `Settings` object.
-* Structured JSON logging (structlog) with a `request_id` bound per request,
-  echoed in `X-Request-ID`, and applied to uvicorn's own logs too.
-* SQLAlchemy 2 declarative base with an explicit constraint naming convention
-  (AC-1.6). Lazy engine, one session per request.
-* Alembic wired to read `DATABASE_URL` from the environment. **No migrations
-  yet** — business tables are phase 1.
-* Ruff, mypy (strict), pytest configured; `warnings` are errors.
+21 tables covering tenancy and identity, catalog and identifiers, vendors and
+import profiles, ingestion, inventory history, matching exceptions, the OOS
+watchlist, source-system retention, and audit.
 
-### Frontend (`frontend/`)
+Full documentation, including the Mermaid ER diagram, the relationship and
+delete-behaviour reference, and index coverage, is in
+[docs/database-schema.md](database-schema.md).
 
-Next.js 15 / React 19 / TypeScript app shell with sidebar navigation, a live API
-status indicator that verifies the environment-based API URL, and placeholder
-screens for all nine admin areas. ESLint flat config, strict `tsconfig`.
+The parts that carry the most weight:
 
-### Infrastructure
+* **Identity.** `products.id` is an immutable UUID and the only foreign-key
+  target; `catalog_item_number` is a unique business attribute. Every FK in the
+  database points at a UUID — asserted by a test, not by review.
+* **Identifiers.** `product_identifiers` is one lookup surface for all identifier
+  types, with vendor and marketplace context enforced by a check constraint, and
+  three partial unique indexes giving each kind its correct scope. A UPC resolves
+  to exactly one product per tenant, which is what makes match priority 1
+  unambiguous rather than "pick the first row".
+* **Multiple Amazon SKUs.** One row per SKU in `marketplace_listings`. Never a
+  delimited column.
+* **Approved mappings.** Priorities 3 and 4 read `mapping_status = 'APPROVED'` on
+  `vendor_products` and `marketplace_listings`, each requiring an approver and a
+  timestamp by check constraint ([ADR 0010](decisions/0010-identifier-model-and-mapping-placement.md)).
+* **Import idempotency.** `import_files.sha256` is unique per tenant; a partial
+  unique index permits only one non-failed `import_jobs` row per file, so a
+  successful import is never silently repeated while a failed one can be retried.
+* **Inventory history is append-only.** Snapshots are keyed
+  `(import_job_id, vendor_product_id)` and every outbound FK is `RESTRICT`, so
+  history cannot be deleted from underneath.
+* **No repeated alerts.** `availability_events` is unique on
+  (`current_snapshot_id`, `event_type`) — one snapshot raises a given transition
+  exactly once.
+* **The watchlist is buying intent.** `desired_quantity`, `max_unit_cost`,
+  `priority`, and `reason` describe what the company wants to purchase, not
+  everything that happens to be at zero stock.
+* **Audit is append-only in the database.** A trigger rejects `UPDATE` and
+  `DELETE` on `audit_events`, including from a direct psql session.
 
-`infra/docker-compose.yml` (postgres 16 + api + web), health checks on all three
-services, named volume `prms_pgdata`, backend and frontend Dockerfiles running as
-non-root, `.env.example` with placeholders only, comprehensive `.gitignore`,
-`Makefile` and `tasks.ps1` task runners, and a README with exact startup steps.
+### Migration
 
-`storage/raw`, `storage/processed`, and `storage/rejected` exist and are
-bind-mounted into the API container. Directory structure is tracked; contents are
-git-ignored, since retained vendor files are business data and may contain
-commercially sensitive pricing (ADR 0004).
+One revision, `506fd0ecc33a`. Beyond the autogenerated tables it enables
+`pg_trgm`, creates the trigram search indexes, installs the audit trigger, and —
+critically — drops the 21 enum types on downgrade. PostgreSQL leaves enum types
+behind when their tables are dropped, so a downgrade that forgets them makes the
+*next* upgrade fail with "type already exists", a defect that would only appear
+in a real deployment. A test asserts the round trip.
 
 ### Deliberately absent
 
-No business tables, no Nineyard client, no matching, no imports, no audit rows,
-no authentication. `models/`, `integrations/`, and `imports/` are empty packages
-whose docstrings record the rules that will govern them.
+No Nineyard client, no file parsing, no matching engine, no audit writer service,
+no API endpoints beyond health, no authentication. Tables were built; behaviour
+was not.
 
 ---
 
 ## 4. Quality gate results
 
-Run on 2026-09-07, Windows 11, Python 3.12.10, Node 24.19.0.
+Run on 2026-09-08. Windows 11, Python 3.12.10, Node 24.19.0, PostgreSQL 16.15.
 
 | Gate | Command | Result |
 |---|---|---|
-| Backend format | `ruff format .` | ✅ 34 files unchanged |
+| Backend format | `ruff format .` | ✅ 55 files unchanged |
 | Backend lint | `ruff check .` | ✅ All checks passed |
-| Backend types | `mypy` (strict) | ✅ No issues in 33 source files |
-| Backend tests | `pytest` | ✅ 21 passed |
+| Backend types | `mypy` (strict) | ✅ No issues in 53 source files |
+| Backend tests | `pytest` | ✅ **98 passed** (21 unit, 77 database-backed) |
+| Migration apply | `alembic upgrade head` | ✅ Applied to PostgreSQL 16.15 |
+| Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types |
+| Migration drift | `alembic check` | ✅ No new upgrade operations detected |
 | Frontend lint | `npm run lint` | ✅ Clean |
 | Frontend types | `npm run typecheck` | ✅ Clean |
 | Frontend build | `npm run build` | ✅ 9 routes prerendered |
 | Compose config | `docker compose config` | ✅ Valid (client-side) |
 
-An additional live smoke test against a real uvicorn process confirmed
-`/health` → 200 with `X-Request-ID`, `/api/v1/health` → 503 `degraded` with
-PostgreSQL absent, and correct CORS handling from a configured origin.
+### A design conflict the tests caught
 
-### Two real defects the gates caught
+`audit_events.actor_user_id` was written as `ON DELETE SET NULL`, the obvious
+choice for "keep the audit entry, forget the user". It is wrong: `SET NULL` makes
+PostgreSQL issue an `UPDATE` against `audit_events` during the delete, which the
+append-only trigger correctly refuses — so deleting a user failed with a
+confusing trigger error rather than a clear constraint error.
 
-Both were found by tests rather than by inspection, and both would have reached
-production.
+Changed to `RESTRICT`, which states the actual rule: a user who has acted cannot
+be deleted, only deactivated. That is consistent with every other entity in this
+schema, and it makes the audit trail genuinely immutable. Two tests now cover it
+— the delete is refused, and deactivation leaves the trail attributable.
 
-* **`CORS_ALLOW_ORIGINS` crashed startup.** pydantic-settings JSON-decodes
-  `list[str]` fields *before* validators run, so the plain value
-  `http://localhost:3000` — exactly what `.env.example` and Compose supply —
-  raised `JSONDecodeError` on boot. Fixed with `Annotated[list[str], NoDecode]`.
-* **An unversioned route escaped `/api/v1`.** `swagger_ui_oauth2_redirect_url`
-  does not follow `docs_url`, so `/docs/oauth2-redirect` was mounted at the root,
-  violating CLAUDE.md §4. Fixed by setting it explicitly.
-
-The route-contract test that should have caught the second one was itself broken:
-FastAPI 0.141 nests included routers behind a private `_IncludedRouter` that
-exposes no `routes` attribute, so walking `app.routes` silently found nothing and
-the assertion passed vacuously. It now enumerates the OpenAPI schema — the actual
-public contract — and asserts the set is non-empty first.
+Nothing found this by inspection. It surfaced because the relationship tests
+issue Core deletes and let the database decide.
 
 ---
 
@@ -139,20 +147,34 @@ public contract — and asserts the set is non-empty first.
 
 | Change | Detail | Reversible |
 |---|---|---|
-| Python 3.12.10 installed | `winget install Python.Python.3.12 --scope user` | `winget uninstall Python.Python.3.12` |
-| Docker Desktop launched | Started; engine did not come up (§6, S1) | Quit the app |
+| Python 3.12.10 installed | `winget install Python.Python.3.12 --scope user` (2026-09-07) | `winget uninstall` |
+| **PostgreSQL 16.15 installed** | `winget install PostgreSQL.PostgreSQL.16`, service `postgresql-x64-16`, port 5432 | `winget uninstall` |
+| Role and databases created | Role `prms` (LOGIN, CREATEDB); databases `prms` and `prms_test` | `DROP DATABASE` / `DROP ROLE` |
+| Docker Desktop launched | Engine still fails to start (§6, S1) | Quit the app |
 
-Neither existed beforehand: there was no Python at all, only the Microsoft Store
-alias stub.
+PostgreSQL was installed natively because the Docker container cannot run on
+this machine. It matches the `postgres:16-alpine` image the Compose file uses,
+so the schema is verified against the same major version that will run in
+deployment.
+
+Two local configuration changes accompanied it:
+
+* `.env` now points `DATABASE_URL` at `localhost` rather than the `postgres`
+  Compose service name. `.env.example` is unchanged and still documents both.
+* `app/core/config.py` resolves `.env` from absolute paths (repository root and
+  `backend/`). Previously a relative `.env` was read from the working directory,
+  so running anything from `backend/` silently missed the file and fell back to
+  defaults — a footgun that would have bitten every developer.
 
 ---
 
 ## 6. Open setup issues
 
-### S1 — Docker cannot run on this machine *(blocks running the stack)*
+### S1 — Docker cannot run on this machine *(blocks running the full stack)*
 
-`docker compose up` has **not** been executed. The Compose file validates, both
-Dockerfiles are written, but the engine cannot start:
+Unchanged from 2026-09-07 and not fixable without elevation and a reboot. The
+Compose file validates and both Dockerfiles are written, but the engine cannot
+start:
 
 ```
 WSL2 is unable to start since virtualization is not enabled on this machine.
@@ -161,9 +183,7 @@ virtualization is turned on in your computer's firmware settings.
 ```
 
 Diagnostics: `HypervisorPresent: False`, `VirtualizationFirmwareEnabled: True`,
-WSL distro `docker-desktop` is `Stopped`. The CPU's virtualization appears
-enabled in firmware, so the likely cause is the missing Windows optional
-component. Confirming that requires elevation, which this session does not have.
+WSL distro `docker-desktop` is `Stopped`.
 
 Fix (elevated PowerShell, then **reboot**):
 
@@ -171,93 +191,85 @@ Fix (elevated PowerShell, then **reboot**):
 wsl.exe --install --no-distribution
 ```
 
-If it still fails after the reboot, enable virtualization (Intel VT-x / AMD-V)
-in the BIOS/UEFI.
-
-Until then the Docker images are unbuilt and unverified, and the following are
-unproven: image builds, container health checks, service dependency ordering,
-the named volume, and Alembic running inside the container. Everything else in
-§4 was verified natively.
+**What this does and does not block.** The schema is fully verified — against
+PostgreSQL 16.15, the same major version as the Compose image, so the migration
+and every constraint are proven. What remains unproven is containerisation:
+image builds, container health checks, service dependency ordering, the named
+volume, and running Alembic inside the container.
 
 ---
 
 ## 7. Blocking questions
 
-Unchanged from planning, with B7 promoted to a numbered question. B1 and B2 gate
-implementation work; the rest shape it.
+Unchanged. B1 and B2 gate implementation work; the rest shape it. B3 and B4 have
+become more pressing now that `vendor_import_profiles` exists and its JSONB rule
+columns need real shapes.
 
 ### B1 — Nineyard API specification *(blocks phase 3 entirely)*
 API documentation and base URL; authentication model and how credentials are
 issued; sandbox availability; rate limits; pagination style; a sample catalog
 item payload identifying the exact **Catalog Item Number** field; whether delta
 sync (`updated_since`) is supported; and whether the API exposes UPC/GTIN and
-Amazon SKU/ASIN.
+Amazon SKU/ASIN. The `nineyard_sync_runs.cursor` column exists on the assumption
+that incremental sync may be possible; if it is not, the column is harmless.
 
 ### B2 — Users, roles, and authentication *(blocks phases 8 and 10)*
-Who reviews exceptions and approves mappings? Is local email/password (A6)
-acceptable, or is there an existing identity provider? Audit attribution and
-approval gating both depend on the answer.
+`users`, `roles`, and `user_roles` are built with tenant-scoped roles and a
+nullable `password_hash`. Confirm whether local email/password with
+admin/reviewer/viewer is right, or whether an existing identity provider is in
+play. Approval gating and audit attribution both depend on it.
 
-### B3 — Pack size and unit-of-measure policy *(shapes phases 4, 6, 9)*
+### B3 — Pack size and unit-of-measure policy *(now shapes a built table)*
+`vendor_import_profiles.pack_size_handling` is JSONB and currently empty.
 Normalize vendor quantities to the catalog unit at import, or store as stated
-and defer conversion? This changes the import profile schema, so settling it
-before phase 4 avoids a migration. Recommendation: store as stated plus pack
-size, and defer — Milestone 1 makes no purchasing decisions.
+and defer conversion? Recommendation unchanged: store as stated plus pack size,
+and defer — Milestone 1 makes no purchasing decisions.
 
 ### B4 — Representative vendor files *(blocks realistic phases 6 and 7)*
 3–5 real vendor files (CSV and XLSX, anonymized), ideally one known-messy
-example, plus typical and maximum row counts and file cadence.
+example, plus typical and maximum row counts and file cadence. These determine
+the concrete shape of `column_map`, `normalization_rules`, and
+`availability_rules`.
 
 ### B5 — Raw file storage destination and retention *(blocks phase 5 deployment)*
 Local disk, S3, Azure Blob, or other? Any retention, deletion, or compliance
-requirement? Development uses the bind-mounted `storage/` directory regardless.
+requirement? `import_files.storage_uri` is a plain string, so any backend fits.
 
 ### B6 — Repository naming and stakeholder expectations
 The repository is named `Power-BI-Data-Analysis-and-Inventory`, but Power BI is
-explicitly out of scope for Milestone 1. Does anyone expect a Power BI
-deliverable in this phase?
+explicitly out of scope for Milestone 1.
 
 ### B7 — Amazon SKU data source
 With SP-API excluded, where do Amazon SKUs come from — manual entry, a
-spreadsheet import, or the Nineyard catalog? If none, match priority 4 has no
-data to operate on. Acceptable, but it should be a deliberate decision.
+spreadsheet import, or the Nineyard catalog? `marketplace_listings` is built and
+ready; without a source, match priority 4 has no data to operate on.
 
 ---
 
 ## 8. Assumptions
 
-Adopted to keep work moving. Each is reversible; each is a place where being
-wrong costs rework. A1–A14 are unchanged from planning; A15–A17 are new to
-phase 0.
+A1–A17 carry forward from earlier phases, with these changes:
 
-| # | Assumption | If wrong |
-|---|---|---|
-| A1 | Nineyard exposes an HTTP/JSON API with token or key authentication, catalog listing with pagination, and a stable Catalog Item Number per item. | Phase 3 is redesigned; the anti-corruption layer limits damage to `integrations/nineyard/`. |
-| A2 | Nineyard is the sole source of canonical product records. An unmatched vendor line becomes an exception, never a new product. | The exception workflow gains a "create product" path and the identity rules need revision. |
-| A3 | Vendor files are supplied manually (upload). No SFTP polling, email ingestion, or vendor API pulls. | Phase 5 grows an ingestion-source abstraction. |
-| A4 | A vendor may have several import profiles, but one file maps to exactly one profile chosen at upload. | Profile auto-detection is added, raising risk R3. |
-| A5 | Vendor files carry at minimum a vendor SKU and a quantity or availability indicator, usually a UPC and description. | Matching signal is weaker than planned; expect a much larger exception queue (R4). |
-| A6 | Local email + password with three roles (admin, reviewer, viewer). No SSO in Milestone 1. | Swap behind `core/security.py`; audit attribution unaffected. |
-| A7 | Raw file retention is indefinite for Milestone 1. | A retention job is added; storage sizing changes. |
-| A8 | Single-tenant: one organization, one Nineyard account, one catalog. | Tenant scoping must be added to every table and query — expensive if deferred. |
-| A9 | Single currency per vendor. Currency is recorded, never converted. | FX handling added later; the column already exists. |
-| A10 | The OOS watchlist is user-curated, not auto-populated from stock levels. | The watchlist gains rule-based auto-population. |
-| A11 | Availability transitions are evaluated per vendor, not aggregated across vendors. | An aggregate product-level view is added in phase 9. |
-| A12 | In-app display of availability events is sufficient. No email/SMS/webhook. | A notification channel is added; out of scope today. |
-| A13 | Deployment target is Linux containers; Windows is the development environment only. | Dockerfiles and CI matrix change. |
-| A14 | Amazon SKUs arrive by manual entry or file import, since SP-API is excluded. | Match priority 4 stays dormant until a data source exists (B7). |
-| A15 | Local-filesystem storage under `storage/` is sufficient for Milestone 1; the S3 backend is deferred until B5 is answered. | Add the S3 `StorageBackend` implementation; the protocol already isolates the choice. |
-| A16 | A single API process is enough for now. The dedicated worker (`app/worker.py`) arrives with phase 5, when imports need to outlive a request. | Nothing built so far needs to change. |
-| A17 | Next.js 15 with the App Router, React 19, and server components by default; client components only where interactivity requires them. | Localised to the frontend. |
+| # | Change |
+|---|---|
+| **A8** | **Superseded.** Single-tenancy no longer holds: the schema is organization-scoped throughout ([ADR 0009](decisions/0009-organization-scoped-multi-tenancy.md)). |
+| **A15** | Confirmed for now — `import_files.storage_uri` is backend-agnostic, so local filesystem today and S3 later needs no schema change. |
+| **A18** *(new)* | Approved mappings live on the owning row rather than in a separate mapping table, so full mapping *history* is reconstructed from `audit_events`. If that becomes a common query, a dedicated history table is the follow-up ([ADR 0010](decisions/0010-identifier-model-and-mapping-placement.md)). |
+| **A19** *(new)* | Tenant isolation relies on repository-layer discipline plus tests. PostgreSQL row-level security is not enabled; it should be evaluated before the first real multi-tenant deployment, since a forgotten `organization_id` filter is a cross-tenant leak the schema alone cannot prevent. |
+| **A20** *(new)* | `pg_trgm` is available in every target environment. It ships with PostgreSQL contrib and is present in both `postgres:16-alpine` and the EDB Windows build. |
+
+The full A1–A17 list is unchanged from the 2026-09-07 revision and remains in
+force.
 
 ---
 
 ## 9. Recommended next step
 
-Phase 1 — database foundation and audit logging — is unblocked and is the
-correct next move: `app_user`, `audit_log`, the transactional audit writer, the
-first Alembic migration, and the AC-1.x schema-invariant tests (UUID keys, no
-naive timestamp columns, no foreign key targeting a business key).
+Finish phase 1 by building the **transactional audit writer service** described
+in [ADR 0006](decisions/0006-transactional-audit-logging.md): a single service
+that writes `audit_events` inside the same transaction as the change it
+describes, with before/after diff capture and `request_id` propagation from the
+existing middleware. The table, its constraints, and the append-only guarantee
+are in place; the writer is what makes them usable.
 
-Resolving S1 is required before the Docker path can be trusted, but it does not
-block phase 1 development if a PostgreSQL instance is available another way.
+Phase 2 (vendor CRUD) is the natural first consumer and is otherwise unblocked.
