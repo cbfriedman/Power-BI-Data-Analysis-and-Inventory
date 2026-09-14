@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-08 (security foundation)
+Last updated: 2026-09-14 (repository hygiene: UTF-8 and line-ending normalisation)
 
 ---
 
@@ -10,17 +10,18 @@ Last updated: 2026-09-08 (security foundation)
 | | |
 |---|---|
 | Milestone | 1 — Data foundation, ingestion, matching |
-| Stage | **Phase 1 complete.** Schema, audit service, and the configuration/security foundation are built. |
-| Application code | Schema, audit service, auth foundation, error handling, redaction. No vendor/import/matching logic. |
+| Stage | **Phase 1 complete; phase 3 diagnostic built.** Schema, audit service, configuration/security foundation, and a read-only Nineyard probe exist. Backend is deployed to Railway. |
+| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe. No vendor/import/matching logic. |
 | Database schema | 21 tables, 21 enum types, 113 indexes, 61 check constraints, 73 foreign keys, 1 append-only trigger |
 | Migrations | 1 revision, applied and reversed against PostgreSQL 16.15 |
-| Backend tests | 210, all passing (104 unit, 106 database-backed) |
-| Quality gates | 8 of 8 passing locally (§4) |
-| Docker stack | **Still unverified** — see §6, issue S1 |
+| Backend tests | 302, all passing (196 unit, 106 database-backed; 256 `def test_` functions — 149 unit, 107 integration — the rest is parametrisation) |
+| Quality gates | 8 of 8 passing locally (§4), 2026-09-14 |
+| Docker stack | Backend image verified locally and running on Railway; frontend image **unbuilt locally** (§6, S1/S2) |
 | Blocking questions open | 7 (see §7); B1 partially answered, B2 narrowed |
 
-The schema, the audit writer, and the security foundation exist and are
-verified. Nothing yet reads a vendor file, calls Nineyard, or matches a product.
+The schema, the audit writer, the security foundation, and a read-only Nineyard
+diagnostic exist and are verified. Nothing yet reads a vendor file, synchronises
+Nineyard data, or matches a product.
 
 ---
 
@@ -34,7 +35,7 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates |
 | 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
 | 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
-| 3 | Nineyard integration + sync | 🟨 Partially unblocked | Auth endpoint and four read-only paths are known. A **read-only diagnostic** exists ([nineyard-integration.md](nineyard-integration.md)); the sync client waits on probe findings — see B1. |
+| 3 | Nineyard integration + sync | 🟨 Diagnostic built, sync not started | Read-only client and CLI probe exist ([nineyard-integration.md](nineyard-integration.md)); the public OpenAPI spec has been analysed ([nineyard-field-mapping.md](nineyard-field-mapping.md)); the probe has **not** been run against the live API (no credentials on the development machine). Sync waits on B1. |
 | 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
 | 5 | File ingestion + raw retention | ⬜ Not started | `import_files` exists; no `StorageBackend` yet |
 | 6 | Parsing + validation + reporting | ⬜ Not started | Needs sample files (B4) |
@@ -95,9 +96,9 @@ The parts that carry the most weight:
 Full detail in [docs/security.md](security.md). In brief:
 
 * **Secrets are typed.** `DATABASE_URL`, `AUTH_JWT_SECRET` and
-  `NINEYARD_API_KEY` are `SecretStr`, so they cannot be printed by accident.
-  Reading a real value takes an explicit `.get_secret_value()` — there are three
-  such calls, all at genuine boundaries.
+  `NINEYARD_PASSWORD` are `SecretStr`, so they cannot be printed by accident.
+  Reading a real value takes an explicit `.get_secret_value()`, which keeps
+  every such use greppable and at a genuine boundary.
 * **Production refuses development defaults.** The shipped signing key, the dev
   token endpoint, and error-detail exposure each prevent start-up when
   `APP_ENV=production`. A signing key under 32 characters is refused everywhere.
@@ -131,8 +132,8 @@ in a real deployment. A test asserts the round trip.
 
 ### Deliberately absent
 
-No Nineyard client, no file parsing, no matching engine, and no vendor or
-import endpoints. No password storage, MFA, refresh tokens, or rate limiting —
+No Nineyard *synchronisation* (the client is read-only and diagnostic), no
+file parsing, no matching engine, and no vendor or import endpoints. No password storage, MFA, refresh tokens, or rate limiting —
 Entra ID will own credentials, and building a half-credential store first would
 be work thrown away ([security.md §8](security.md) lists this honestly).
 
@@ -140,20 +141,20 @@ be work thrown away ([security.md §8](security.md) lists this honestly).
 
 ## 4. Quality gate results
 
-Run on 2026-09-08 (security foundation). Windows 11, Python 3.12.10, Node 24.19.0, PostgreSQL 16.15.
+Run on 2026-09-14 via `.	asks.ps1 check`. Windows 11, Python 3.12.10, Node 24.19.0, PostgreSQL 16.15.
 
 | Gate | Command | Result |
 |---|---|---|
-| Backend format | `ruff format .` | ✅ 72 files unchanged |
+| Backend format | `ruff format .` | ✅ 83 files unchanged |
 | Backend lint | `ruff check .` | ✅ All checks passed |
-| Backend types | `mypy` (strict) | ✅ No issues in 70 source files |
-| Backend tests | `pytest` | ✅ **210 passed** (104 unit, 106 database-backed) |
+| Backend types | `mypy` (strict) | ✅ No issues in 81 source files |
+| Backend tests | `pytest` | ✅ **302 passed** in 7.11s (196 unit, 106 database-backed) |
 | Migration apply | `alembic upgrade head` | ✅ Applied to PostgreSQL 16.15 |
 | Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types |
 | Migration drift | `alembic check` | ✅ No new upgrade operations detected |
 | Frontend lint | `npm run lint` | ✅ Clean |
 | Frontend types | `npm run typecheck` | ✅ Clean |
-| Frontend build | `npm run build` | ✅ 9 routes prerendered |
+| Frontend build | `npm run build` | ✅ 10 routes prerendered (12 static pages) |
 | Compose config | `docker compose config` | ✅ Valid (client-side) |
 
 ### A design conflict the tests caught
@@ -171,6 +172,22 @@ schema, and it makes the audit trail genuinely immutable. Two tests now cover it
 
 Nothing found this by inspection. It surfaced because the relationship tests
 issue Core deletes and let the database decide.
+
+### Repository hygiene (2026-09-14)
+
+`README.md` had been committed as **UTF-16 LE without a BOM**, so Git stored it
+as a binary blob and GitHub rendered it as garbage. It was decoded and rewritten
+as UTF-8 without BOM; the decoded text was verified character-for-character
+identical to the original (6,755 characters, 209 lines) before the write.
+
+A scan of all 148 tracked files found no other non-UTF-8 file and no UTF-8 BOM.
+Every committed blob already used LF; CRLF appeared only in the working copy
+via `core.autocrlf`. A root `.gitattributes` now pins `* text=auto eol=lf` and
+`*.ps1 text eol=crlf` so neither problem depends on a contributor's machine
+again. `git add --renormalize .` changed nothing but `README.md`.
+
+The README's "No migrations exist yet" sentence was also corrected: revision
+`506fd0ecc33a` exists.
 
 ### Three more the security tests caught
 
@@ -219,11 +236,14 @@ Two local configuration changes accompanied it:
 
 ## 6. Open setup issues
 
-### S1 — Docker cannot run on this machine *(blocks running the full stack)*
+### S1 — Docker is intermittent on this machine *(blocks the full Compose stack)*
 
-Unchanged from 2026-09-07 and not fixable without elevation and a reboot. The
-Compose file validates and both Dockerfiles are written, but the engine cannot
-start:
+The engine started on 2026-09-08 long enough to build and run the **backend**
+image (`PORT` injection and the production start-up guards were verified in the
+real image), but the **frontend** image has never built locally: `npm ci`
+fails inside the container with `ECONNRESET` because of a Docker networking
+fault on this machine — see [deployment.md](deployment.md). The original
+failure mode was:
 
 ```
 WSL2 is unable to start since virtualization is not enabled on this machine.
@@ -241,10 +261,22 @@ wsl.exe --install --no-distribution
 ```
 
 **What this does and does not block.** The schema is fully verified — against
-PostgreSQL 16.15, the same major version as the Compose image, so the migration
-and every constraint are proven. What remains unproven is containerisation:
-image builds, container health checks, service dependency ordering, the named
-volume, and running Alembic inside the container.
+PostgreSQL 16.15, the same major version as the Compose image. The backend
+image is verified. What remains unproven locally is the frontend image build,
+the Compose service dependency ordering, the named volume, and running Alembic
+inside the container.
+
+### S2 — Deployment state (Railway)
+
+The **backend** service is deployed and healthy: `GET /api/v1/health` returns
+`{"status":"ok","environment":"production","dependencies":[{"name":"postgresql","status":"ok"}]}`
+against Railway's managed PostgreSQL. Still to do, in order: set
+`alembic upgrade head` as the backend pre-deploy command; create the
+`frontend` service (Root Directory `frontend`, `NEXT_PUBLIC_API_BASE_URL` set
+**before** the first build); set backend `CORS_ALLOW_ORIGINS` to the frontend
+origin. The first Railway frontend build is the real test of the frontend
+image. There is **no authentication in production yet** — see
+[deployment.md](deployment.md) before any mutation endpoint ships.
 
 ---
 

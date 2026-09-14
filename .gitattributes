@@ -1,0 +1,6 @@
+# Normalise line endings so encoding and EOL never depend on a contributor's
+# machine again (README.md was once committed as UTF-16).
+* text=auto eol=lf
+
+# Windows PowerShell 5.1 reads .ps1 files as ANSI and expects CRLF.
+*.ps1 text eol=crlf
