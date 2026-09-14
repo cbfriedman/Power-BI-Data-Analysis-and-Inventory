@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-14 (repository hygiene: UTF-8 and line-ending normalisation)
+Last updated: 2026-09-14 (test counts verified; re-planning recorded in §10)
 
 ---
 
@@ -14,7 +14,7 @@ Last updated: 2026-09-14 (repository hygiene: UTF-8 and line-ending normalisatio
 | Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe. No vendor/import/matching logic. |
 | Database schema | 21 tables, 21 enum types, 113 indexes, 61 check constraints, 73 foreign keys, 1 append-only trigger |
 | Migrations | 1 revision, applied and reversed against PostgreSQL 16.15 |
-| Backend tests | 302, all passing (196 unit, 106 database-backed; 256 `def test_` functions — 149 unit, 107 integration — the rest is parametrisation) |
+| Backend tests | **302 passed** (`pytest`: 196 unit + 106 integration). `git grep -c "def test_"` finds 256 functions (149 unit, 107 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
 | Quality gates | 8 of 8 passing locally (§4), 2026-09-14 |
 | Docker stack | Backend image verified locally and running on Railway; frontend image **unbuilt locally** (§6, S1/S2) |
 | Blocking questions open | 7 (see §7); B1 partially answered, B2 narrowed |
@@ -35,7 +35,7 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates |
 | 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
 | 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
-| 3 | Nineyard integration + sync | 🟨 Diagnostic built, sync not started | Read-only client and CLI probe exist ([nineyard-integration.md](nineyard-integration.md)); the public OpenAPI spec has been analysed ([nineyard-field-mapping.md](nineyard-field-mapping.md)); the probe has **not** been run against the live API (no credentials on the development machine). Sync waits on B1. |
+| 3 | Nineyard integration + sync | 🟨 Diagnostic only | **Exists:** read-only client (`app/integrations/nineyard/client.py`, `errors.py`, `sanitize.py`), probe (`app/integrations/nineyard/probe.py`), and CLI (`app/cli/nineyard_probe.py`), tested by `tests/unit/test_nineyard_client.py`, `test_nineyard_probe.py`, `test_nineyard_cli.py` (mocked; no live calls). The public OpenAPI spec has been analysed ([nineyard-field-mapping.md](nineyard-field-mapping.md)). **Does not exist:** any sync service — nothing writes Nineyard data to `products`, `product_identifiers`, `marketplace_listings`, `nineyard_sync_runs`, or `nineyard_item_payloads`. The probe has not been run against the live API. See [nineyard-integration.md](nineyard-integration.md) and B1. |
 | 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
 | 5 | File ingestion + raw retention | ⬜ Not started | `import_files` exists; no `StorageBackend` yet |
 | 6 | Parsing + validation + reporting | ⬜ Not started | Needs sample files (B4) |
@@ -148,7 +148,7 @@ Run on 2026-09-14 via `.	asks.ps1 check`. Windows 11, Python 3.12.10, Node 24.19
 | Backend format | `ruff format .` | ✅ 83 files unchanged |
 | Backend lint | `ruff check .` | ✅ All checks passed |
 | Backend types | `mypy` (strict) | ✅ No issues in 81 source files |
-| Backend tests | `pytest` | ✅ **302 passed** in 7.11s (196 unit, 106 database-backed) |
+| Backend tests | `pytest` | ✅ `302 passed in 6.49s` — `tests/unit`: `196 passed`; `tests/integration`: `106 passed` |
 | Migration apply | `alembic upgrade head` | ✅ Applied to PostgreSQL 16.15 |
 | Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types |
 | Migration drift | `alembic check` | ✅ No new upgrade operations detected |
@@ -379,6 +379,9 @@ force.
 
 ## 9. Recommended next step
 
+> **Superseded by §10.** The order below is the Milestone 1 order, which now
+> follows the Amazon proof of concept.
+
 **Phase 2 — the vendor database.** It is fully unblocked and is the natural
 first consumer of everything phase 1 built: CRUD under `/api/v1/vendors`, guarded
 by `require_roles(RoleCode.DATA_OPERATOR)`, with each mutation wrapped in
@@ -389,3 +392,18 @@ usable rather than merely present.
 
 Phase 4 (import profiles) follows, though its JSONB rule shapes still want real
 vendor files (B4).
+
+---
+
+## 10. Re-planning (2026-09-14)
+
+The client has requested an **Amazon SP-API proof of concept** as the first
+technical milestone. This is a scope change — Amazon SP-API is listed as out of
+Milestone 1 in [CLAUDE.md §3](../CLAUDE.md) and
+[milestone-1-scope.md §3](milestone-1-scope.md) — and an ADR in
+[decisions/](decisions/) will record it, including what the POC must
+demonstrate and what it deliberately leaves out. The work order is now
+**(a)** the Amazon POC, then **(b)** Milestone 1 phases 2 through 11 in the
+order documented in [architecture.md §6](architecture.md#6-implementation-order).
+Nothing already built is affected: phases 0, 1, and the phase 3 diagnostic stand
+as delivered, and the blocking questions in §7 remain open.
