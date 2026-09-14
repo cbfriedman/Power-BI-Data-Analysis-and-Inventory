@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-14 (GitHub Actions CI added; Compose stack verified)
+Last updated: 2026-09-14 (tenant scoping helper, ADR 0012)
 
 ---
 
@@ -11,10 +11,10 @@ Last updated: 2026-09-14 (GitHub Actions CI added; Compose stack verified)
 |---|---|
 | Milestone | 1 — Data foundation, ingestion, matching |
 | Stage | **Phase 1 complete; phase 3 diagnostic built.** Schema, audit service, configuration/security foundation, and a read-only Nineyard probe exist. Backend is deployed to Railway. |
-| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe. No vendor/import/matching logic. |
+| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012). No vendor/import/matching logic. |
 | Database schema | 21 tables, 21 enum types, 113 indexes, 61 check constraints, 73 foreign keys, 1 append-only trigger |
 | Migrations | 1 revision, applied and reversed against PostgreSQL 16.15 |
-| Backend tests | **302 passed** (`pytest`: 196 unit + 106 integration). `git grep -c "def test_"` finds 256 functions (149 unit, 107 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
+| Backend tests | **379 passed** (`pytest`: 266 unit + 113 integration). `git grep -c "def test_"` finds 274 functions (160 unit, 114 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
 | Quality gates | 8 of 8 passing locally **and in GitHub Actions** (§4), 2026-09-14 |
 | Docker stack | **Verified in CI** — full `docker compose up --build` from `.env.example`, API healthy against PostgreSQL, migration applied and checked, web answering (§4, §6 S1). Backend also live on Railway (§6 S2). |
 | Blocking questions open | 8 (see §7); B1 partially answered, B2 narrowed, B7 partially answered by ADR 0011, B8 new |
@@ -131,6 +131,26 @@ behind when their tables are dropped, so a downgrade that forgets them makes the
 *next* upgrade fail with "type already exists", a defect that would only appear
 in a real deployment. A test asserts the round trip.
 
+### Tenant scoping helper (2026-09-14, ADR 0012)
+
+`app/repositories/scoping.py` is the interim rule for tenant isolation until
+row-level security is introduced. `TenantScope(organization_id)` builds
+`select`/`update`/`delete` statements with
+`WHERE Model.organization_id = :id` already applied — the clause is written in
+one method and nowhere else — and `ScopedRepository` is the base class every
+future repository inherits. It refuses a model without
+`OrganizationScopedMixin` and refuses a non-UUID tenant id, because `None`
+would compile to `IS NULL` and match nothing silently.
+
+`tests/unit/test_tenant_scoping.py` enumerates every scoped model from the ORM
+registry (20 today — every table except `organizations`, asserted), and proves
+from compiled SQL that all three statement kinds carry the filter for each.
+`tests/integration/test_tenant_scoping.py` creates two organizations with a
+vendor of the **same code** in each — which the per-organization unique index
+permits, and which is exactly the shape of a leak — and proves select, update
+and delete stay inside the caller's tenant, including a lookup by the other
+tenant's primary key. Assumption A19 is amended accordingly.
+
 ### Deliberately absent
 
 No Nineyard *synchronisation* (the client is read-only and diagnostic), no
@@ -157,10 +177,10 @@ file: https://github.com/cbfriedman/Power-BI-Data-Analysis-and-Inventory/actions
 
 | Gate | Command | Result |
 |---|---|---|
-| Backend format | `ruff format .` | ✅ 83 files unchanged |
+| Backend format | `ruff format .` | ✅ 86 files unchanged |
 | Backend lint | `ruff check .` | ✅ All checks passed |
-| Backend types | `mypy` (strict) | ✅ No issues in 81 source files |
-| Backend tests | `pytest` | ✅ `302 passed in 6.49s` — `tests/unit`: `196 passed`; `tests/integration`: `106 passed` |
+| Backend types | `mypy` (strict) | ✅ No issues in 84 source files |
+| Backend tests | `pytest` | ✅ `379 passed in 5.70s` — `tests/unit`: `266 passed`; `tests/integration`: `113 passed` |
 | Migration apply | `alembic upgrade head` | ✅ Applied to PostgreSQL 16.15 |
 | Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types |
 | Migration drift | `alembic check` | ✅ No new upgrade operations detected |
@@ -393,7 +413,7 @@ A1–A17 carry forward from earlier phases, with these changes:
 | **A8** | **Superseded.** Single-tenancy no longer holds: the schema is organization-scoped throughout ([ADR 0009](decisions/0009-organization-scoped-multi-tenancy.md)). |
 | **A15** | Confirmed for now — `import_files.storage_uri` is backend-agnostic, so local filesystem today and S3 later needs no schema change. |
 | **A18** *(new)* | Approved mappings live on the owning row rather than in a separate mapping table, so full mapping *history* is reconstructed from `audit_events`. If that becomes a common query, a dedicated history table is the follow-up ([ADR 0010](decisions/0010-identifier-model-and-mapping-placement.md)). |
-| **A19** *(new)* | Tenant isolation relies on repository-layer discipline plus tests. PostgreSQL row-level security is not enabled; it should be evaluated before the first real multi-tenant deployment, since a forgotten `organization_id` filter is a cross-tenant leak the schema alone cannot prevent. |
+| **A19** *(amended 2026-09-14)* | Tenant isolation is enforced in the repository layer by `app/repositories/scoping.py`, which every repository must use ([ADR 0012](decisions/0012-tenant-scoping-enforced-in-repository-layer.md)); unit and integration tests fix the rule in place. PostgreSQL row-level security remains **deferred** until the first multi-tenant deployment, when it is added in addition to the helper, not instead of it. |
 | **A20** | `pg_trgm` is available in every target environment. It ships with PostgreSQL contrib and is present in both `postgres:16-alpine` and the EDB Windows build. |
 | **A21** *(new)* | Microsoft Entra ID is the intended production identity provider. The `AuthenticationBackend` protocol is shaped for it; if a different provider is chosen, the protocol still holds but the JWKS/RS256 assumptions in `EntraIdAuthenticationBackend` would change. |
 | **A22** *(new)* | The service sits behind a proxy that sets `X-Forwarded-For`. Exposed directly, that header is caller-supplied and the recorded client address is worth nothing (the value is validated, so a bad one is simply dropped). |
