@@ -1,6 +1,6 @@
 # Deployment
 
-Status: **Configured for Railway; not yet deployed.**
+Status: **Backend deployed to Railway and healthy; frontend service not yet created.** Stack proven in CI — see [Continuous integration](#continuous-integration).
 **Backend image: verified.** Builds clean, and was run with `PORT=7777`
 injected — it listened on that port and answered `/health` with 200. Production
 start-up guards were confirmed in the real image: `DEV_AUTH_ENABLED=true` with
@@ -237,6 +237,31 @@ Then open the frontend. The dashboard's **System status** card should read "All
 systems operational". If it reads "Offline", `NEXT_PUBLIC_API_BASE_URL` was wrong
 at build time — see gotcha 1, and note that fixing the variable requires a
 **rebuild**, not a restart.
+
+---
+
+## Continuous integration
+
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs three
+independent jobs on every push and pull request. A newer push to the same
+branch cancels the older run.
+
+| Job | Runner | What it proves |
+|---|---|---|
+| `backend` | Ubuntu, Python 3.12, `postgres:16-alpine` service container | `ruff format --check`, `ruff check`, `mypy` (strict), `pytest -q`. `DATABASE_URL` points at the service container; `tests/integration/conftest.py` derives `prms_test` from it and creates the database itself, so the integration suite runs rather than skips. pip is cached on `backend/pyproject.toml`. |
+| `frontend` | Ubuntu, Node 24 | `npm ci`, `eslint`, `tsc --noEmit`, `next build`. npm is cached on `frontend/package-lock.json`. |
+| `compose-smoke` | Ubuntu with Docker | Copies `.env.example` to `.env`, runs `docker compose up -d --build` on `infra/docker-compose.yml`, waits up to 120 s for `GET /api/v1/health` to return 200 (which requires PostgreSQL to be reachable from inside the `api` container), runs `alembic upgrade head` then `alembic check` inside the container, and confirms the `web` container answers on port 3000. On failure it dumps `docker compose logs`; it always runs `docker compose down -v`. |
+
+The smoke job matters more than the other two: it is Milestone 1 exit
+criterion #1 ([milestone-1-scope.md §4](milestone-1-scope.md)) — "`docker
+compose up` yields a working Postgres + API + web stack from a clean checkout
+using only `.env` variables" — and the development machine cannot run Docker,
+so CI is the only place it is verified. It also builds the frontend image,
+which could not be built locally (see the note at the top of this document).
+
+The `backend` and `frontend` jobs run the same commands as `.	asks.ps1 check`
+and `make check`; a green local run should mean a green CI run, and a
+difference between the two is a real finding.
 
 ---
 

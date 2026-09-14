@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-14 (ADR 0011 recorded; Amazon SP-API ingestion admitted to scope)
+Last updated: 2026-09-14 (GitHub Actions CI added; Compose stack verified)
 
 ---
 
@@ -15,8 +15,8 @@ Last updated: 2026-09-14 (ADR 0011 recorded; Amazon SP-API ingestion admitted to
 | Database schema | 21 tables, 21 enum types, 113 indexes, 61 check constraints, 73 foreign keys, 1 append-only trigger |
 | Migrations | 1 revision, applied and reversed against PostgreSQL 16.15 |
 | Backend tests | **302 passed** (`pytest`: 196 unit + 106 integration). `git grep -c "def test_"` finds 256 functions (149 unit, 107 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
-| Quality gates | 8 of 8 passing locally (§4), 2026-09-14 |
-| Docker stack | Backend image verified locally and running on Railway; frontend image **unbuilt locally** (§6, S1/S2) |
+| Quality gates | 8 of 8 passing locally **and in GitHub Actions** (§4), 2026-09-14 |
+| Docker stack | **Verified in CI** — full `docker compose up --build` from `.env.example`, API healthy against PostgreSQL, migration applied and checked, web answering (§4, §6 S1). Backend also live on Railway (§6 S2). |
 | Blocking questions open | 8 (see §7); B1 partially answered, B2 narrowed, B7 partially answered by ADR 0011, B8 new |
 
 The schema, the audit writer, the security foundation, and a read-only Nineyard
@@ -32,7 +32,7 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 | # | Phase | Status | Notes |
 |---|---|---|---|
 | — | Planning and documentation | ✅ Complete | Scope, architecture, criteria, 10 ADRs |
-| 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates |
+| 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates, GitHub Actions CI (2026-09-14) |
 | 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
 | A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | ⬜ Not started | Precedes phase 2 by client request (§10). No code, tables, dependencies, or configuration exist yet. Blocked on B8 for anything against the real account. |
 | 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
@@ -143,6 +143,17 @@ be work thrown away ([security.md §8](security.md) lists this honestly).
 ## 4. Quality gate results
 
 Run on 2026-09-14 via `.	asks.ps1 check`. Windows 11, Python 3.12.10, Node 24.19.0, PostgreSQL 16.15.
+The same gates run in GitHub Actions on every push
+([`.github/workflows/ci.yml`](../.github/workflows/ci.yml), described in
+[deployment.md](deployment.md#continuous-integration)). First run, all three
+jobs green on the first attempt with no change to any Dockerfile or the Compose
+file: https://github.com/cbfriedman/Power-BI-Data-Analysis-and-Inventory/actions/runs/34892991973.
+
+| CI job | Result |
+|---|---|
+| `backend` (Ubuntu, Python 3.12, `postgres:16-alpine` service) | ✅ 83 files formatted · ruff clean · mypy clean (81 files) · **`302 passed in 5.63s`**, 0 skipped — the integration suite ran against the service container |
+| `frontend` (Ubuntu, Node 24) | ✅ `npm ci`, eslint, tsc, `next build` |
+| `compose-smoke` (Ubuntu, Docker) | ✅ all three images built; `/api/v1/health` → 200 with `postgresql: ok` 2 s after start; `alembic upgrade head` applied `506fd0ecc33a`; `alembic check` → "No new upgrade operations detected"; web answered on :3000; `down -v` clean. 93 s end to end. |
 
 | Gate | Command | Result |
 |---|---|---|
@@ -237,14 +248,21 @@ Two local configuration changes accompanied it:
 
 ## 6. Open setup issues
 
-### S1 — Docker is intermittent on this machine *(blocks the full Compose stack)*
+### S1 — Docker is intermittent on this machine *(no longer blocks anything)*
 
-The engine started on 2026-09-08 long enough to build and run the **backend**
-image (`PORT` injection and the production start-up guards were verified in the
-real image), but the **frontend** image has never built locally: `npm ci`
-fails inside the container with `ECONNRESET` because of a Docker networking
-fault on this machine — see [deployment.md](deployment.md). The original
-failure mode was:
+**The Compose stack is verified in CI** (§4): the `compose-smoke` job builds
+all three images from a clean checkout, starts them from `.env.example`,
+confirms the API reports PostgreSQL healthy, applies and checks the migration
+inside the `api` container, and confirms the web container answers. That is
+Milestone 1 exit criterion #1, and it passed on the first run with no change
+to any Dockerfile or the Compose file. The frontend image, which could never
+be built on this machine, built cleanly there.
+
+What remains true locally: the engine is unreliable here. It ran on
+2026-09-08 long enough to build the **backend** image, but the **frontend**
+image fails in `npm ci` with `ECONNRESET` because of a Docker networking fault
+on this machine — see [deployment.md](deployment.md). The original failure
+mode was:
 
 ```
 WSL2 is unable to start since virtualization is not enabled on this machine.
@@ -261,11 +279,9 @@ Fix (elevated PowerShell, then **reboot**):
 wsl.exe --install --no-distribution
 ```
 
-**What this does and does not block.** The schema is fully verified — against
-PostgreSQL 16.15, the same major version as the Compose image. The backend
-image is verified. What remains unproven locally is the frontend image build,
-the Compose service dependency ordering, the named volume, and running Alembic
-inside the container.
+**What this does and does not block.** Nothing, now. Local Docker is a
+convenience; CI is the proof. Anyone changing a Dockerfile or the Compose file
+should expect the `compose-smoke` job to be the arbiter.
 
 ### S2 — Deployment state (Railway)
 

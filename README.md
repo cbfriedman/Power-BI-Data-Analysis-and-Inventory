@@ -1,11 +1,14 @@
 # Purchasing & Replenishment Management System
 
+[![CI](https://github.com/cbfriedman/Power-BI-Data-Analysis-and-Inventory/actions/workflows/ci.yml/badge.svg)](https://github.com/cbfriedman/Power-BI-Data-Analysis-and-Inventory/actions/workflows/ci.yml)
+
 Milestone 1 — data foundation, Nineyard catalog synchronisation, vendor
 inventory ingestion, and deterministic product matching.
 
-**Current state: phase 0 scaffold.** The stack builds, runs, and passes every
-quality gate. No business tables, no Nineyard client, and no matching logic
-exist yet. See [docs/phase1-status.md](docs/phase1-status.md) for exactly what
+**Current state:** the database schema (21 tables, one reversible migration),
+the audit and security foundation, and a read-only Nineyard diagnostic exist
+and pass every quality gate. No vendor CRUD, file ingestion, or matching logic
+exists yet. See [docs/phase1-status.md](docs/phase1-status.md) for exactly what
 is built and what comes next.
 
 Rules that govern all work in this repository are in [CLAUDE.md](CLAUDE.md).
