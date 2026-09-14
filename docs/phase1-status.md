@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-14 (test counts verified; re-planning recorded in §10)
+Last updated: 2026-09-14 (ADR 0011 recorded; Amazon SP-API ingestion admitted to scope)
 
 ---
 
@@ -17,7 +17,7 @@ Last updated: 2026-09-14 (test counts verified; re-planning recorded in §10)
 | Backend tests | **302 passed** (`pytest`: 196 unit + 106 integration). `git grep -c "def test_"` finds 256 functions (149 unit, 107 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
 | Quality gates | 8 of 8 passing locally (§4), 2026-09-14 |
 | Docker stack | Backend image verified locally and running on Railway; frontend image **unbuilt locally** (§6, S1/S2) |
-| Blocking questions open | 7 (see §7); B1 partially answered, B2 narrowed |
+| Blocking questions open | 8 (see §7); B1 partially answered, B2 narrowed, B7 partially answered by ADR 0011, B8 new |
 
 The schema, the audit writer, the security foundation, and a read-only Nineyard
 diagnostic exist and are verified. Nothing yet reads a vendor file, synchronises
@@ -34,6 +34,7 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 | — | Planning and documentation | ✅ Complete | Scope, architecture, criteria, 10 ADRs |
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates |
 | 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
+| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | ⬜ Not started | Precedes phase 2 by client request (§10). No code, tables, dependencies, or configuration exist yet. Blocked on B8 for anything against the real account. |
 | 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
 | 3 | Nineyard integration + sync | 🟨 Diagnostic only | **Exists:** read-only client (`app/integrations/nineyard/client.py`, `errors.py`, `sanitize.py`), probe (`app/integrations/nineyard/probe.py`), and CLI (`app/cli/nineyard_probe.py`), tested by `tests/unit/test_nineyard_client.py`, `test_nineyard_probe.py`, `test_nineyard_cli.py` (mocked; no live calls). The public OpenAPI spec has been analysed ([nineyard-field-mapping.md](nineyard-field-mapping.md)). **Does not exist:** any sync service — nothing writes Nineyard data to `products`, `product_identifiers`, `marketplace_listings`, `nineyard_sync_runs`, or `nineyard_item_payloads`. The probe has not been run against the live API. See [nineyard-integration.md](nineyard-integration.md) and B1. |
 | 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
@@ -350,10 +351,19 @@ requirement? `import_files.storage_uri` is a plain string, so any backend fits.
 The repository is named `Power-BI-Data-Analysis-and-Inventory`, but Power BI is
 explicitly out of scope for Milestone 1.
 
-### B7 — Amazon SKU data source
-With SP-API excluded, where do Amazon SKUs come from — manual entry, a
-spreadsheet import, or the Nineyard catalog? `marketplace_listings` is built and
-ready; without a source, match priority 4 has no data to operate on.
+### B7 — Amazon SKU data source *(partially answered by ADR 0011)*
+[ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)
+makes the read-only SP-API listings retrieval a source for
+`marketplace_listings`. Still open: whether *every* Amazon SKU the client sells
+is visible through that account and marketplace set, or whether some still
+need import or manual entry.
+
+### B8 — Amazon SP-API credentials *(new; blocks any live POC run)*
+The client must register an SP-API application (or authorise an existing one)
+and supply the LWA client id, client secret, refresh token, seller id, and
+marketplace id(s) as environment variables on the machine or service that runs
+the ingestion. Until then the POC can be built and tested only against mocked
+responses. None of these values will ever be committed, logged, or printed.
 
 ---
 
@@ -400,10 +410,18 @@ vendor files (B4).
 The client has requested an **Amazon SP-API proof of concept** as the first
 technical milestone. This is a scope change — Amazon SP-API is listed as out of
 Milestone 1 in [CLAUDE.md §3](../CLAUDE.md) and
-[milestone-1-scope.md §3](milestone-1-scope.md) — and an ADR in
-[decisions/](decisions/) will record it, including what the POC must
-demonstrate and what it deliberately leaves out. The work order is now
+[milestone-1-scope.md §3](milestone-1-scope.md) — and
+[ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)
+records it: exactly what the bounded, read-only ingestion includes, what stays
+out (no writes to Amazon, no buyer PII, no replenishment math), and the new
+tables, dependencies (`python-amazon-sp-api`, APScheduler 3.x), and
+configuration it brings. CLAUDE.md §2 now lists it as item 14 and §3 narrows
+the Amazon exclusion accordingly. The work order is now
 **(a)** the Amazon POC, then **(b)** Milestone 1 phases 2 through 11 in the
 order documented in [architecture.md §6](architecture.md#6-implementation-order).
 Nothing already built is affected: phases 0, 1, and the phase 3 diagnostic stand
-as delivered, and the blocking questions in §7 remain open.
+as delivered. The blocking questions in §7 remain open, B7 now has a partial
+answer, and B8 (SP-API credentials) is new. Still to do before the POC starts:
+an AC-14 group in [acceptance-criteria.md](acceptance-criteria.md) and a
+credential section in [security.md](security.md), both listed as follow-ups in
+the ADR.

@@ -36,12 +36,13 @@ Authoritative scope documents:
 11. Detection of previously unavailable products that become available
 12. Basic audit logging
 13. Minimal administration interface
+14. Amazon SP-API read-only ingestion (ADR 0011)
 
 ## 3. Explicitly OUT of Milestone 1
 
 Do not build, stub, scaffold, or add dependencies for any of the following:
 
-- Amazon SP-API
+- Amazon SP-API beyond the read-only ingestion defined in ADR 0011 (no writes, no PII, no replenishment math)
 - ConnectBooks
 - Replenishment calculations
 - Profitability calculations

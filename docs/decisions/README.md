@@ -27,5 +27,6 @@ otherwise be tempted to "fix" without knowing why it is the way it is.
 | [0008](0008-synchronous-sqlalchemy.md) | Synchronous SQLAlchemy, and no pandas in the import path | Accepted |
 | [0009](0009-organization-scoped-multi-tenancy.md) | Organization-scoped multi-tenancy from the first migration | Accepted |
 | [0010](0010-identifier-model-and-mapping-placement.md) | Identifier model, and where approved mappings live | Accepted |
+| [0011](0011-amazon-sp-api-proof-of-concept-in-milestone-1.md) | Admit a read-only Amazon SP-API ingestion into Milestone 1 | Accepted |
 
 Statuses: `Proposed` · `Accepted` · `Superseded by NNNN` · `Deprecated`

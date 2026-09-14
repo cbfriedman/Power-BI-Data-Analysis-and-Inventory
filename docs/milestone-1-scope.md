@@ -1,7 +1,7 @@
 # Milestone 1 — Scope
 
-Status: **Planning complete, implementation not started.**
-Last updated: 2026-09-07
+Status: **In delivery.** Scope amended by [ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md); progress in [phase1-status.md](phase1-status.md).
+Last updated: 2026-09-14
 
 ---
 
@@ -86,6 +86,17 @@ Next.js application covering: vendors, import profiles, import upload + batch
 status + report, exception queue review, product lookup, watchlist, availability
 events, and audit log browsing. Function over polish.
 
+### 2.14 Amazon SP-API read-only ingestion
+Added by [ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)
+at the client's request, and bounded to exactly: LWA authentication; retrieval
+of order lines sufficient for 7/14/30-day sales velocity; retrieval of FBA
+inventory including inbound quantities, and FBM quantity; retrieval of listings
+so Amazon seller SKUs can be mapped to the Nineyard Catalog Item Number / UPC
+structure through the matching chain in §2.7; storage in PostgreSQL; scheduled
+ingestion; error handling and logging; one read-only velocity endpoint and one
+CLI. **Read-only throughout** — no write to Amazon, no buyer PII, no
+Restricted Data Tokens.
+
 ---
 
 ## 3. Out of scope
@@ -94,7 +105,7 @@ The following are **not** built, stubbed, or depended upon in this milestone:
 
 | Excluded | Note |
 |---|---|
-| Amazon SP-API | No Amazon API calls. Amazon SKUs are stored data only (needed by match priority 4). |
+| Amazon SP-API beyond the read-only ingestion in §2.14 | No writes to Amazon, no buyer PII or Restricted Data Tokens, no replenishment math. See [ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md). |
 | ConnectBooks | No accounting integration. |
 | Replenishment calculations | No reorder points, coverage, or demand math. |
 | Profitability calculations | No margin/landed-cost math. |
@@ -104,12 +115,14 @@ The following are **not** built, stubbed, or depended upon in this milestone:
 | Analyzer.tools | No integration. |
 | Power BI | No datasets, gateways, or exports — despite the repository name. |
 | Walmart integration | No Walmart channel. |
+| Inbound vendor email monitoring | No mailbox polling, attachment harvesting, or email-triggered imports. Vendor files arrive by upload or drop-in (§2.5). |
 
 ### Boundary clarifications
 
-- **Amazon SKUs**: the `amazon_sku` table and approved Amazon SKU mappings are
-  in scope because match priority 4 requires them. They are populated by import
-  or manual entry, never by SP-API.
+- **Amazon SKUs**: the `marketplace_listings` table and approved Amazon SKU
+  mappings are in scope because match priority 4 requires them. They may be
+  populated by the read-only SP-API ingestion (§2.14), by import, or by manual
+  entry. Approval of a mapping is always a human action (§2.8).
 - **Scheduling**: a job runner sufficient to trigger catalog sync and process
   imports is in scope. A general workflow engine is not.
 - **Notifications**: availability events are recorded and displayed in-app.
