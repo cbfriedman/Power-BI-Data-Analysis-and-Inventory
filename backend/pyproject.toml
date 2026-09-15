@@ -21,6 +21,9 @@ dependencies = [
     # Also used by starlette's TestClient, so the project has one HTTP library
     # rather than httpx and httpx2 side by side.
     "httpx2>=2.12",
+    # Amazon SP-API (ADR 0011). Wrapped by app/integrations/amazon; its types
+    # stop at that boundary.
+    "python-amazon-sp-api>=1.9",
 ]
 
 [project.optional-dependencies]
@@ -87,6 +90,12 @@ plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 module = ["alembic.*"]
+ignore_missing_imports = true
+
+# python-amazon-sp-api ships no type information. Its types stop at the
+# anti-corruption layer in app/integrations/amazon, which is fully typed.
+[[tool.mypy.overrides]]
+module = ["sp_api.*"]
 ignore_missing_imports = true
 
 # -----------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-15 (Amazon SP-API settings and secret redaction — POC step 1)
+Last updated: 2026-09-15 (read-only Amazon SP-API client — POC step 2)
 
 ---
 
@@ -11,10 +11,10 @@ Last updated: 2026-09-15 (Amazon SP-API settings and secret redaction — POC st
 |---|---|
 | Milestone | 1 — Data foundation, ingestion, matching |
 | Stage | **Phase 1 complete; phase 3 diagnostic built.** Schema, audit service, configuration/security foundation, and a read-only Nineyard probe exist. Backend is deployed to Railway. |
-| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012), Amazon SP-API configuration and secret handling (no client yet). No vendor/import/matching logic. |
+| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012), Amazon SP-API configuration and a read-only SP-API client behind an anti-corruption layer (nothing calls it yet). No vendor/import/matching logic. |
 | Database schema | 21 tables, 21 enum types, 113 indexes, 61 check constraints, 73 foreign keys, 1 append-only trigger |
 | Migrations | 1 revision, applied and reversed against PostgreSQL 16.15 |
-| Backend tests | **418 passed** (`pytest`: 305 unit + 113 integration). `git grep -c "def test_"` finds 294 functions (180 unit, 114 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
+| Backend tests | **468 passed** (`pytest`: 355 unit + 113 integration). `git grep -c "def test_"` finds 339 functions (225 unit, 114 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
 | Quality gates | 8 of 8 passing locally **and in GitHub Actions** (§4), 2026-09-14 |
 | Docker stack | **Verified in CI** — full `docker compose up --build` from `.env.example`, API healthy against PostgreSQL, migration applied and checked, web answering (§4, §6 S1). Backend also live on Railway (§6 S2). |
 | Blocking questions open | 8 (see §7); B1 partially answered, B2 narrowed, B7 partially answered by ADR 0011, B8 new |
@@ -34,7 +34,7 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 | — | Planning and documentation | ✅ Complete | Scope, architecture, criteria, 10 ADRs |
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates, GitHub Actions CI (2026-09-14) |
 | 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
-| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | 🟨 Configuration only | Precedes phase 2 by client request (§10). **Exists:** typed settings (`AMAZON_*`), `amazon_configured`, start-up refusal when enabled but incomplete, LWA/SP-API redaction rules, `.env.example` block. **Does not exist:** client, tables, scheduler, endpoint, CLI, or any dependency. Live checks blocked on B8. |
+| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | 🟨 Client built, not yet used | Precedes phase 2 by client request (§10). **Exists:** typed settings, redaction rules, and `app/integrations/amazon/` — a read-only client over `python-amazon-sp-api` with five operations, typed DTOs, a five-class error taxonomy and a retry policy ([amazon-integration.md](amazon-integration.md)), tested against fakes only. **Does not exist:** tables, ingestion service, scheduler, endpoint, CLI. Nothing has run against the real account (B8). |
 | 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
 | 3 | Nineyard integration + sync | 🟨 Diagnostic only | **Exists:** read-only client (`app/integrations/nineyard/client.py`, `errors.py`, `sanitize.py`), probe (`app/integrations/nineyard/probe.py`), and CLI (`app/cli/nineyard_probe.py`), tested by `tests/unit/test_nineyard_client.py`, `test_nineyard_probe.py`, `test_nineyard_cli.py` (mocked; no live calls). The public OpenAPI spec has been analysed ([nineyard-field-mapping.md](nineyard-field-mapping.md)). **Does not exist:** any sync service — nothing writes Nineyard data to `products`, `product_identifiers`, `marketplace_listings`, `nineyard_sync_runs`, or `nineyard_item_payloads`. The probe has not been run against the live API. See [nineyard-integration.md](nineyard-integration.md) and B1. |
 | 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
@@ -151,6 +151,45 @@ permits, and which is exactly the shape of a leak — and proves select, update
 and delete stay inside the caller's tenant, including a lookup by the other
 tenant's primary key. Assumption A19 is amended accordingly.
 
+### Amazon SP-API client — the anti-corruption layer (2026-09-15, POC step 2)
+
+`app/integrations/amazon/` wraps `python-amazon-sp-api` 2.1.23 (MIT, now a
+dependency) the way `app/integrations/nineyard/` wraps Nineyard (ADR 0007).
+Full description in [amazon-integration.md](amazon-integration.md). The
+points that matter most:
+
+* **Read-only by structure.** `AmazonClient` has exactly five public
+  methods — `request_report`, `get_report_status`,
+  `download_report_document`, `fetch_report`, `iter_inventory_summaries` —
+  and no generic call method. A test asserts the set and a second asserts no
+  write-shaped name (`create_`, `put_`, `post_`, `update_`, `delete_`,
+  `submit_`) exists other than `request_report`.
+* **One credential boundary.** The library's `{refresh_token, lwa_app_id,
+  lwa_client_secret}` dict is built in one private method from `SecretStr`
+  values and passed straight to the library constructor; it is not stored,
+  logged or returned. A test drives a request through the real logging
+  pipeline at `DEBUG`, adds the library's own logger output, and asserts no
+  secret reaches the output.
+* **Two library behaviours closed off**, found by reading the installed
+  code rather than its README: `SP_API_DEFAULT_MARKETPLACE` in the
+  environment silently overrides an explicitly passed marketplace (the
+  client refuses to construct while it is set), and the library will look for
+  credentials in its own env vars and config files if not given a dict (it
+  always is).
+* **Retries** only on the library's 429 / 500 / 503 / 504 exceptions, capped
+  exponential backoff with jitter, `Retry-After` honoured, attempts from
+  `AMAZON_MAX_ATTEMPTS`; LWA failures are never retried. A throttled
+  inventory page is re-requested with the same `nextToken`.
+* **50 unit tests** against fakes of the library classes: credential
+  boundary, each DTO from a realistic payload, three-page pagination,
+  retry-then-succeed, exhaustion into `AmazonRateLimited` /
+  `AmazonTransientError`, auth not retried, `fetch_report` reaching `DONE`,
+  `CANCELLED`, `FATAL` and timeout.
+
+Not yet verified against the real account: the application's SP-API roles,
+report latency, real throttling, and the report charset — listed in the
+doc's §7.
+
 ### Amazon SP-API configuration and secret handling (2026-09-15, POC step 1)
 
 The first slice of the ADR 0011 work, done before credentials arrive so that
@@ -213,10 +252,10 @@ file: https://github.com/cbfriedman/Power-BI-Data-Analysis-and-Inventory/actions
 
 | Gate | Command | Result |
 |---|---|---|
-| Backend format | `ruff format .` | ✅ 86 files unchanged |
+| Backend format | `ruff format .` | ✅ 91 files unchanged |
 | Backend lint | `ruff check .` | ✅ All checks passed |
-| Backend types | `mypy` (strict) | ✅ No issues in 84 source files |
-| Backend tests | `pytest` | ✅ `418 passed in 8.54s` — `tests/unit`: `305 passed`; `tests/integration`: `113 passed` |
+| Backend types | `mypy` (strict) | ✅ No issues in 89 source files |
+| Backend tests | `pytest` | ✅ `468 passed in 7.52s` — `tests/unit`: `355 passed`; `tests/integration`: `113 passed` |
 | Migration apply | `alembic upgrade head` | ✅ Applied to PostgreSQL 16.15 |
 | Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types |
 | Migration drift | `alembic check` | ✅ No new upgrade operations detected |
