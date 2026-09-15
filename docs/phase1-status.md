@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-14 (tenant scoping helper, ADR 0012)
+Last updated: 2026-09-15 (Amazon SP-API settings and secret redaction — POC step 1)
 
 ---
 
@@ -11,10 +11,10 @@ Last updated: 2026-09-14 (tenant scoping helper, ADR 0012)
 |---|---|
 | Milestone | 1 — Data foundation, ingestion, matching |
 | Stage | **Phase 1 complete; phase 3 diagnostic built.** Schema, audit service, configuration/security foundation, and a read-only Nineyard probe exist. Backend is deployed to Railway. |
-| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012). No vendor/import/matching logic. |
+| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012), Amazon SP-API configuration and secret handling (no client yet). No vendor/import/matching logic. |
 | Database schema | 21 tables, 21 enum types, 113 indexes, 61 check constraints, 73 foreign keys, 1 append-only trigger |
 | Migrations | 1 revision, applied and reversed against PostgreSQL 16.15 |
-| Backend tests | **379 passed** (`pytest`: 266 unit + 113 integration). `git grep -c "def test_"` finds 274 functions (160 unit, 114 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
+| Backend tests | **418 passed** (`pytest`: 305 unit + 113 integration). `git grep -c "def test_"` finds 294 functions (180 unit, 114 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
 | Quality gates | 8 of 8 passing locally **and in GitHub Actions** (§4), 2026-09-14 |
 | Docker stack | **Verified in CI** — full `docker compose up --build` from `.env.example`, API healthy against PostgreSQL, migration applied and checked, web answering (§4, §6 S1). Backend also live on Railway (§6 S2). |
 | Blocking questions open | 8 (see §7); B1 partially answered, B2 narrowed, B7 partially answered by ADR 0011, B8 new |
@@ -34,7 +34,7 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 | — | Planning and documentation | ✅ Complete | Scope, architecture, criteria, 10 ADRs |
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates, GitHub Actions CI (2026-09-14) |
 | 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
-| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | ⬜ Not started | Precedes phase 2 by client request (§10). No code, tables, dependencies, or configuration exist yet. Blocked on B8 for anything against the real account. |
+| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | 🟨 Configuration only | Precedes phase 2 by client request (§10). **Exists:** typed settings (`AMAZON_*`), `amazon_configured`, start-up refusal when enabled but incomplete, LWA/SP-API redaction rules, `.env.example` block. **Does not exist:** client, tables, scheduler, endpoint, CLI, or any dependency. Live checks blocked on B8. |
 | 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
 | 3 | Nineyard integration + sync | 🟨 Diagnostic only | **Exists:** read-only client (`app/integrations/nineyard/client.py`, `errors.py`, `sanitize.py`), probe (`app/integrations/nineyard/probe.py`), and CLI (`app/cli/nineyard_probe.py`), tested by `tests/unit/test_nineyard_client.py`, `test_nineyard_probe.py`, `test_nineyard_cli.py` (mocked; no live calls). The public OpenAPI spec has been analysed ([nineyard-field-mapping.md](nineyard-field-mapping.md)). **Does not exist:** any sync service — nothing writes Nineyard data to `products`, `product_identifiers`, `marketplace_listings`, `nineyard_sync_runs`, or `nineyard_item_payloads`. The probe has not been run against the live API. See [nineyard-integration.md](nineyard-integration.md) and B1. |
 | 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
@@ -151,6 +151,42 @@ permits, and which is exactly the shape of a leak — and proves select, update
 and delete stay inside the caller's tenant, including a lookup by the other
 tenant's primary key. Assumption A19 is amended accordingly.
 
+### Amazon SP-API configuration and secret handling (2026-09-15, POC step 1)
+
+The first slice of the ADR 0011 work, done before credentials arrive so that
+nothing about their handling is improvised later:
+
+* **Settings** (`app/core/config.py`): `amazon_enabled`, `amazon_lwa_client_id`,
+  `amazon_lwa_client_secret` and `amazon_lwa_refresh_token` (both `SecretStr`),
+  `amazon_seller_id`, `amazon_marketplace_id` (default `ATVPDKIKX0DER`),
+  `amazon_region` (validated to `NA`/`EU`/`FE`), `amazon_timeout_seconds`,
+  `amazon_max_attempts`. `amazon_configured` is true only when all four
+  credentials are present and non-blank. With `AMAZON_ENABLED=true` and any of
+  them missing, start-up is refused in **every** environment with a message
+  naming exactly the missing variables — the same fail-fast style as the
+  production guards.
+* **Redaction** (`app/core/redaction.py`): `refresh_token`, `client_secret`,
+  `lwa_*` and `x-amz-access-token` are masked by key. Two value patterns were
+  added, and one of them closed a real gap: the existing inline rule caught
+  `access_token=...` but **not** the JSON form `"access_token": "..."` — the
+  closing quote after the key broke the match — so a raw LWA token-endpoint
+  body logged by an HTTP library would have passed through intact. JSON
+  members named `access_token`, `refresh_token`, `client_secret`, `id_token`,
+  `api_key`, `password`, `secret` or `authorization` are now masked, and so is
+  the bare LWA token shape (`Atza|…` access, `Atzr|…` refresh) wherever it
+  appears.
+* **Tests:** 39 new unit cases across `test_config.py`, `test_settings_secrets.py`
+  and `test_redaction.py`, including that `repr(settings)`, `safe_dump()` and a
+  real structlog line never contain the secret values, and the end-to-end
+  pipeline masks the SP-API header, the token body and a token in free text.
+* `.env.example` documents the variables with the Seller Central path
+  (Apps & Services > Develop Apps, self-authorised private app). No real value
+  exists anywhere in the repository.
+
+Still owed from the ADR 0011 follow-ups: an AC-14 group in
+[acceptance-criteria.md](acceptance-criteria.md) and an Amazon section in
+[security.md](security.md).
+
 ### Deliberately absent
 
 No Nineyard *synchronisation* (the client is read-only and diagnostic), no
@@ -180,7 +216,7 @@ file: https://github.com/cbfriedman/Power-BI-Data-Analysis-and-Inventory/actions
 | Backend format | `ruff format .` | ✅ 86 files unchanged |
 | Backend lint | `ruff check .` | ✅ All checks passed |
 | Backend types | `mypy` (strict) | ✅ No issues in 84 source files |
-| Backend tests | `pytest` | ✅ `379 passed in 5.70s` — `tests/unit`: `266 passed`; `tests/integration`: `113 passed` |
+| Backend tests | `pytest` | ✅ `418 passed in 8.54s` — `tests/unit`: `305 passed`; `tests/integration`: `113 passed` |
 | Migration apply | `alembic upgrade head` | ✅ Applied to PostgreSQL 16.15 |
 | Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types |
 | Migration drift | `alembic check` | ✅ No new upgrade operations detected |

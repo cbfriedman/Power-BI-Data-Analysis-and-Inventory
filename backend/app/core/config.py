@@ -44,6 +44,10 @@ INSECURE_DEV_JWT_SECRET = "insecure-development-signing-key-change-me"
 # RFC 7518 §3.2: an HS256 key should be at least as long as the hash output.
 MIN_JWT_SECRET_LENGTH = 32
 
+# SP-API is served from three regional endpoints. Anything else is a typo that
+# would otherwise surface as an unexplained connection failure.
+AMAZON_REGIONS = frozenset({"NA", "EU", "FE"})
+
 
 class Settings(BaseSettings):
     """Typed application settings sourced from the environment."""
@@ -107,6 +111,43 @@ class Settings(BaseSettings):
             and self.nineyard_password is not None
             and self.nineyard_company_id is not None
         )
+
+    # --- Amazon SP-API (read-only ingestion, ADR 0011) -----------------------
+    # Login with Amazon: a long-lived refresh token is exchanged for short-lived
+    # access tokens. The client id is an identifier, not a secret, but it is
+    # still redacted in logs because it is useless to anyone reading them and
+    # names the application. Everything else is SecretStr. Obtained from
+    # Seller Central > Apps & Services > Develop Apps (self-authorised app).
+    amazon_enabled: bool = False
+    amazon_lwa_client_id: str | None = None
+    amazon_lwa_client_secret: SecretStr | None = None
+    amazon_lwa_refresh_token: SecretStr | None = None
+    amazon_seller_id: str | None = None
+    # ATVPDKIKX0DER is amazon.com.
+    amazon_marketplace_id: str = "ATVPDKIKX0DER"
+    amazon_region: str = "NA"
+    amazon_timeout_seconds: float = 60.0
+    # Applies to transient failures only, as with Nineyard. SP-API throttles
+    # aggressively, so the ceiling is higher.
+    amazon_max_attempts: int = 5
+
+    @property
+    def amazon_configured(self) -> bool:
+        """True only when every credential the LWA exchange needs is present."""
+        return not self._missing_amazon_settings()
+
+    def _missing_amazon_settings(self) -> list[str]:
+        required = {
+            "AMAZON_LWA_CLIENT_ID": self.amazon_lwa_client_id,
+            "AMAZON_LWA_CLIENT_SECRET": self.amazon_lwa_client_secret,
+            "AMAZON_LWA_REFRESH_TOKEN": self.amazon_lwa_refresh_token,
+            "AMAZON_SELLER_ID": self.amazon_seller_id,
+        }
+        return [
+            name
+            for name, value in required.items()
+            if value is None or not _secret_or_str(value).strip()
+        ]
 
     # --- HTTP ----------------------------------------------------------------
     # NoDecode stops pydantic-settings from JSON-decoding the environment value
@@ -174,6 +215,18 @@ class Settings(BaseSettings):
             return value.strip().upper()
         return value
 
+    @field_validator("amazon_region", mode="before")
+    @classmethod
+    def _require_a_known_amazon_region(cls, value: object) -> object:
+        if isinstance(value, str):
+            region = value.strip().upper()
+            if region not in AMAZON_REGIONS:
+                raise ValueError(
+                    f"AMAZON_REGION must be one of {sorted(AMAZON_REGIONS)}, got {value!r}"
+                )
+            return region
+        return value
+
     @field_validator("auth_jwt_secret")
     @classmethod
     def _require_a_strong_signing_key(cls, value: SecretStr) -> SecretStr:
@@ -204,6 +257,24 @@ class Settings(BaseSettings):
             raise ValueError(f"Refusing to start in {self.app_env!r}: " + "; ".join(problems))
         return self
 
+    @model_validator(mode="after")
+    def _refuse_enabled_but_unconfigured_amazon(self) -> Settings:
+        """Fail at start-up, not at the first scheduled ingestion hours later.
+
+        Applies in every environment: a half-configured integration is a
+        mistake wherever it happens, and the message names exactly what is
+        missing so the fix does not need a debugger.
+        """
+        if not self.amazon_enabled:
+            return self
+        missing = self._missing_amazon_settings()
+        if missing:
+            raise ValueError(
+                "Refusing to start: AMAZON_ENABLED is true but the integration is not "
+                "configured; missing " + ", ".join(missing)
+            )
+        return self
+
     def safe_dump(self) -> dict[str, Any]:
         """A representation safe to log or return from a diagnostics endpoint.
 
@@ -211,6 +282,10 @@ class Settings(BaseSettings):
         anything sensitive that arrived under a plain string field.
         """
         return redact_mapping(self.model_dump(mode="json"))
+
+
+def _secret_or_str(value: SecretStr | str) -> str:
+    return value.get_secret_value() if isinstance(value, SecretStr) else value
 
 
 @lru_cache(maxsize=1)

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any, ClassVar
+
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from app.core.config import Settings, get_settings
 
@@ -97,3 +99,100 @@ class TestDatabaseUrlNormalisation:
         settings = Settings(database_url="sqlite:///./local.db")
 
         assert settings.database_url.get_secret_value() == "sqlite:///./local.db"
+
+
+class TestAmazonSettings:
+    """Read-only SP-API configuration (ADR 0011)."""
+
+    FULL: ClassVar[dict[str, Any]] = {
+        "amazon_lwa_client_id": "amzn1.application-oa2-client.test",
+        "amazon_lwa_client_secret": "amzn1.oa2-cs.v1.test-secret",
+        "amazon_lwa_refresh_token": "Atzr|test-refresh-token-value-0123456789",
+        "amazon_seller_id": "A1TESTSELLER",
+    }
+
+    def test_defaults_are_disabled_and_unconfigured(self) -> None:
+        settings = Settings()
+
+        assert settings.amazon_enabled is False
+        assert settings.amazon_configured is False
+        assert settings.amazon_marketplace_id == "ATVPDKIKX0DER"
+        assert settings.amazon_region == "NA"
+        assert settings.amazon_timeout_seconds == 60.0
+        assert settings.amazon_max_attempts == 5
+
+    def test_configured_when_all_four_credentials_are_present(self) -> None:
+        assert Settings(**self.FULL).amazon_configured is True
+
+    @pytest.mark.parametrize("missing", sorted(FULL))
+    def test_not_configured_when_any_credential_is_absent(self, missing: str) -> None:
+        partial = {k: v for k, v in self.FULL.items() if k != missing}
+
+        assert Settings(**partial).amazon_configured is False
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_a_blank_credential_counts_as_absent(self, blank: str) -> None:
+        """An empty environment variable is still set; it must not pass."""
+        assert Settings(**{**self.FULL, "amazon_seller_id": blank}).amazon_configured is False
+
+    def test_enabled_without_configuration_refuses_to_start(self) -> None:
+        with pytest.raises(ValidationError, match="AMAZON_ENABLED is true") as excinfo:
+            Settings(amazon_enabled=True)
+
+        # The message names every missing variable, so the fix is obvious.
+        message = str(excinfo.value)
+        for name in (
+            "AMAZON_LWA_CLIENT_ID",
+            "AMAZON_LWA_CLIENT_SECRET",
+            "AMAZON_LWA_REFRESH_TOKEN",
+            "AMAZON_SELLER_ID",
+        ):
+            assert name in message
+
+    def test_enabled_with_one_missing_names_only_that_one(self) -> None:
+        partial = {k: v for k, v in self.FULL.items() if k != "amazon_seller_id"}
+
+        with pytest.raises(ValidationError, match="missing AMAZON_SELLER_ID") as excinfo:
+            Settings(amazon_enabled=True, **partial)
+
+        assert "AMAZON_LWA_CLIENT_ID" not in str(excinfo.value)
+
+    def test_enabled_and_configured_starts(self) -> None:
+        settings = Settings(amazon_enabled=True, **self.FULL)
+
+        assert settings.amazon_enabled and settings.amazon_configured
+
+    def test_the_guard_applies_outside_production_too(self) -> None:
+        """A half-configured integration is a mistake in any environment."""
+        with pytest.raises(ValidationError, match="AMAZON_ENABLED"):
+            Settings(app_env="local", amazon_enabled=True)
+
+    def test_settings_read_from_upper_cased_environment_names(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AMAZON_ENABLED", "true")
+        monkeypatch.setenv("AMAZON_LWA_CLIENT_ID", self.FULL["amazon_lwa_client_id"])
+        monkeypatch.setenv("AMAZON_LWA_CLIENT_SECRET", self.FULL["amazon_lwa_client_secret"])
+        monkeypatch.setenv("AMAZON_LWA_REFRESH_TOKEN", self.FULL["amazon_lwa_refresh_token"])
+        monkeypatch.setenv("AMAZON_SELLER_ID", self.FULL["amazon_seller_id"])
+        monkeypatch.setenv("AMAZON_MARKETPLACE_ID", "A1F83G8C2ARO7P")
+        monkeypatch.setenv("AMAZON_REGION", "eu")
+        monkeypatch.setenv("AMAZON_TIMEOUT_SECONDS", "15.5")
+        monkeypatch.setenv("AMAZON_MAX_ATTEMPTS", "2")
+
+        settings = Settings()
+
+        assert settings.amazon_enabled is True
+        assert settings.amazon_configured is True
+        assert settings.amazon_marketplace_id == "A1F83G8C2ARO7P"
+        assert settings.amazon_region == "EU"
+        assert settings.amazon_timeout_seconds == 15.5
+        assert settings.amazon_max_attempts == 2
+
+    @pytest.mark.parametrize("region", ["NA", "eu", " fe "])
+    def test_region_is_normalised_to_a_known_endpoint(self, region: str) -> None:
+        assert Settings(amazon_region=region).amazon_region == region.strip().upper()
+
+    def test_an_unknown_region_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="AMAZON_REGION must be one of"):
+            Settings(amazon_region="us-east-1")

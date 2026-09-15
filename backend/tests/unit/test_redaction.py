@@ -43,6 +43,16 @@ class TestSensitiveKeys:
             "Cookie",
             "database_url",
             "dsn",
+            # Amazon SP-API / LWA (ADR 0011)
+            "refresh_token",
+            "REFRESH_TOKEN",
+            "amazon_lwa_refresh_token",
+            "client_secret",
+            "amazon_lwa_client_secret",
+            "lwa_client_id",
+            "LWA_CLIENT_ID",
+            "x-amz-access-token",
+            "X-Amz-Access-Token",
         ],
     )
     def test_sensitive_keys_are_recognised(self, key: str) -> None:
@@ -50,7 +60,17 @@ class TestSensitiveKeys:
 
     @pytest.mark.parametrize(
         "key",
-        ["email", "user_id", "vendor_code", "token_type", "expires_in", "status_code"],
+        [
+            "email",
+            "user_id",
+            "vendor_code",
+            "token_type",
+            "expires_in",
+            "status_code",
+            "amazon_seller_id",
+            "amazon_marketplace_id",
+            "amazon_region",
+        ],
     )
     def test_ordinary_keys_are_left_alone(self, key: str) -> None:
         assert not is_sensitive_key(key)
@@ -193,3 +213,84 @@ class TestTokenFingerprintAllowlist:
 
         assert redacted["token_fingerprint"] == "abc123"
         assert redacted["access_token"] == REDACTED
+
+
+class TestAmazonRedaction:
+    """Login with Amazon token shapes and the SP-API request header (ADR 0011)."""
+
+    ACCESS = "Atza|IwEBIExampleAccessToken_abcdefghijklmnopqrstuvwxyz0123456789"
+    REFRESH = "Atzr|IwEBIExampleRefreshToken_abcdefghijklmnopqrstuvwxyz0123456789"
+
+    def test_the_lwa_token_response_body_is_masked(self) -> None:
+        """The raw JSON an HTTP library would log on a debug line."""
+        body = (
+            f'{{"access_token": "{self.ACCESS}", "refresh_token": "{self.REFRESH}", '
+            '"token_type": "bearer", "expires_in": 3600}'
+        )
+
+        masked = redact_text(body)
+
+        assert self.ACCESS not in masked
+        assert self.REFRESH not in masked
+        assert '"token_type": "bearer"' in masked
+        assert '"expires_in": 3600' in masked
+
+    def test_an_access_token_json_field_is_masked_whatever_its_value(self) -> None:
+        """The field name alone is enough; the value need not look like a token."""
+        masked = redact_text('{"access_token": "opaque-value-without-prefix", "expires_in": 60}')
+
+        assert "opaque-value-without-prefix" not in masked
+        assert masked == f'{{"access_token": "{REDACTED}", "expires_in": 60}}'
+
+    def test_json_field_matching_is_case_insensitive_and_whitespace_tolerant(self) -> None:
+        masked = redact_text('{ "Access_Token" :"abc" }')
+
+        assert "abc" not in masked
+
+    @pytest.mark.parametrize("token", [ACCESS, REFRESH])
+    def test_a_bare_lwa_token_in_free_text_is_masked(self, token: str) -> None:
+        masked = redact_text(f"exchange returned {token} for the seller")
+
+        assert token not in masked
+        assert "for the seller" in masked
+
+    def test_the_sp_api_access_token_header_is_masked(self) -> None:
+        event = {
+            "event": "amazon.request",
+            "headers": {
+                "x-amz-access-token": self.ACCESS,
+                "x-amz-date": "20260915T000000Z",
+                "user-agent": "prms/0.1",
+            },
+        }
+
+        redacted = redact_mapping(event)
+
+        assert redacted["headers"]["x-amz-access-token"] == REDACTED
+        assert redacted["headers"]["x-amz-date"] == "20260915T000000Z"
+        assert self.ACCESS not in json.dumps(redacted)
+
+    def test_lwa_keys_are_masked_at_any_depth(self) -> None:
+        event = {"config": {"amazon": {"lwa_client_id": "amzn1.app", "lwa_client_secret": "s"}}}
+
+        redacted = redact_mapping(event)
+
+        assert redacted["config"]["amazon"]["lwa_client_id"] == REDACTED
+        assert redacted["config"]["amazon"]["lwa_client_secret"] == REDACTED
+
+    def test_end_to_end_through_the_logging_pipeline(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        configure_logging(Settings(log_level="INFO", log_format="json"))
+
+        get_logger("test").info(
+            "lwa.exchange",
+            headers={"x-amz-access-token": self.ACCESS},
+            body=f'{{"access_token": "{self.ACCESS}"}}',
+            note=f"refresh token was {self.REFRESH}",
+        )
+
+        line = capsys.readouterr().out
+        assert self.ACCESS not in line
+        assert self.REFRESH not in line
+        assert json.loads(line.strip())["event"] == "lwa.exchange"

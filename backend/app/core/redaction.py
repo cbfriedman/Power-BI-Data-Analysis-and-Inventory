@@ -49,6 +49,14 @@ _SENSITIVE_KEY_PARTS: Final[tuple[str, ...]] = (
     "cookie",
     "session_id",
     "client_secret",
+    # Amazon SP-API / Login with Amazon (ADR 0011). "token" and "secret" above
+    # already cover refresh_token, client_secret and x-amz-access-token; they
+    # are listed by name so the intent survives a future edit of the generic
+    # entries. "lwa_" catches the client id too — an identifier rather than a
+    # secret, but of no use in a log and it names the application.
+    "refresh_token",
+    "x-amz-access-token",
+    "lwa_",
     "connection_string",
     "dsn",
     # A DSN carries a password. Masked whole under its own key; a DSN appearing
@@ -91,6 +99,19 @@ _INLINE_ASSIGNMENT_RE: Final = re.compile(
     r"|client[_-]?secret|authorization)\b(\s*[=:]\s*)([^\s,;&\"')]+)"
 )
 
+# The same names as JSON object members: `"access_token": "..."`. The closing
+# quote after the key defeats _INLINE_ASSIGNMENT_RE, so a raw token-endpoint
+# response body logged by an HTTP library would otherwise pass through intact.
+_JSON_FIELD_RE: Final = re.compile(
+    r'(?i)("(?:access_token|refresh_token|client_secret|id_token|api[_-]?key|password'
+    r'|secret|authorization)"\s*:\s*")([^"]*)(")'
+)
+
+# Login with Amazon tokens have a fixed prefix: `Atza|` for access tokens,
+# `Atzr|` for refresh tokens. Matched bare, so one pasted into any message is
+# masked whatever surrounds it.
+_LWA_TOKEN_RE: Final = re.compile(r"\bAtz[ar]\|[A-Za-z0-9_\-]{16,}")
+
 
 def is_sensitive_key(key: str) -> bool:
     """Whether a mapping key's value should be masked outright."""
@@ -105,6 +126,8 @@ def redact_text(value: str) -> str:
     masked = _URL_CREDENTIALS_RE.sub(rf"\1:{REDACTED}@", value)
     masked = _BEARER_RE.sub(rf"\1 {REDACTED}", masked)
     masked = _JWT_RE.sub(REDACTED, masked)
+    masked = _LWA_TOKEN_RE.sub(REDACTED, masked)
+    masked = _JSON_FIELD_RE.sub(rf"\1{REDACTED}\3", masked)
     return _INLINE_ASSIGNMENT_RE.sub(rf"\1\2{REDACTED}", masked)
 
 
