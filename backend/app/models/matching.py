@@ -29,7 +29,7 @@ from app.models.mixins import (
 )
 
 if TYPE_CHECKING:
-    from app.models.catalog import Product
+    from app.models.catalog import MarketplaceListing, Product
     from app.models.identity import User
     from app.models.ingestion import ImportJob, ImportJobRow
     from app.models.vendor import Vendor, VendorProduct
@@ -49,11 +49,17 @@ class ProductMappingException(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Time
     import_job_row_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("import_job_rows.id", ondelete="SET NULL"), nullable=True
     )
-    vendor_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("vendors.id", ondelete="RESTRICT"), nullable=False
+    # An exception is about one of two things: a vendor line (vendor import)
+    # or a marketplace listing (Amazon). At least one must be named; the
+    # check constraint below enforces it.
+    vendor_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("vendors.id", ondelete="RESTRICT"), nullable=True
     )
     vendor_product_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("vendor_products.id", ondelete="CASCADE"), nullable=True
+    )
+    marketplace_listing_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("marketplace_listings.id", ondelete="CASCADE"), nullable=True
     )
 
     reason: Mapped[ExceptionReason] = mapped_column(
@@ -95,8 +101,9 @@ class ProductMappingException(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Time
 
     import_job: Mapped[ImportJob | None] = relationship()
     import_job_row: Mapped[ImportJobRow | None] = relationship()
-    vendor: Mapped[Vendor] = relationship()
+    vendor: Mapped[Vendor | None] = relationship()
     vendor_product: Mapped[VendorProduct | None] = relationship()
+    marketplace_listing: Mapped[MarketplaceListing | None] = relationship()
     suggested_product: Mapped[Product | None] = relationship(foreign_keys=[suggested_product_id])
     resolved_product: Mapped[Product | None] = relationship(foreign_keys=[resolved_product_id])
     assigned_to: Mapped[User | None] = relationship(foreign_keys=[assigned_to_user_id])
@@ -111,6 +118,19 @@ class ProductMappingException(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Time
             "vendor_product_id",
             unique=True,
             postgresql_where=text("status = 'PENDING' and vendor_product_id is not null"),
+        ),
+        # Likewise one open item per marketplace listing.
+        Index(
+            "uq_product_mapping_exceptions_pending_listing",
+            "organization_id",
+            "marketplace_listing_id",
+            unique=True,
+            postgresql_where=text("status = 'PENDING' and marketplace_listing_id is not null"),
+        ),
+        Index(
+            "ix_product_mapping_exceptions_marketplace_listing_id",
+            "marketplace_listing_id",
+            postgresql_where=text("marketplace_listing_id is not null"),
         ),
         # Queue view: oldest pending first.
         Index(
@@ -152,5 +172,15 @@ class ProductMappingException(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Time
         CheckConstraint(
             "suggestion_score is null or (suggestion_score >= 0 and suggestion_score <= 1)",
             name="suggestion_score_is_a_ratio",
+        ),
+        # Every exception is about something: a vendor (line) or a listing.
+        CheckConstraint(
+            "vendor_id is not null or marketplace_listing_id is not null",
+            name="has_a_subject",
+        ),
+        # A vendor line implies its vendor.
+        CheckConstraint(
+            "vendor_product_id is null or vendor_id is not null",
+            name="vendor_product_requires_vendor",
         ),
     )

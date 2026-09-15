@@ -161,6 +161,9 @@ def test_the_migration_creates_the_expected_index_coverage(
         "ix_amazon_order_lines_purchase_date",
         "uq_amazon_inventory_snapshots_run_sku",
         "ix_amazon_inventory_snapshots_sku_captured_at",
+        # Listing mapping (3de5c4e5def0)
+        "ix_marketplace_listings_organization_id_mapping_status",
+        "uq_product_mapping_exceptions_pending_listing",
     }
 
     assert required <= indexes, f"missing indexes: {sorted(required - indexes)}"
@@ -205,5 +208,45 @@ def test_the_amazon_revision_reverses_without_touching_shared_enums(
     assert "nineyard_sync_runs" in tables
 
     # And it comes back cleanly.
+    run_migrations(scratch_database_url)
+    check_migrations(scratch_database_url)
+
+
+def test_the_listing_mapping_revision_reverses_and_reapplies(scratch_database_url: URL) -> None:
+    """Check constraints are hand-written in 3de5c4e5def0; both directions must agree."""
+    run_migrations(scratch_database_url)
+    downgrade_migrations(scratch_database_url, "3767ee979011")
+
+    engine = create_engine(scratch_database_url)
+    try:
+        with engine.connect() as connection:
+            checks = set(
+                connection.execute(
+                    text(
+                        "select conname from pg_constraint"
+                        " where connamespace = 'public'::regnamespace and contype = 'c'"
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            listing_columns = set(
+                connection.execute(
+                    text(
+                        "select column_name from information_schema.columns"
+                        " where table_name = 'marketplace_listings'"
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    finally:
+        engine.dispose()
+
+    assert "ck_marketplace_listings_approved_requires_product" not in checks
+    assert "ck_product_mapping_exceptions_has_a_subject" not in checks
+    assert "ck_product_identifiers_context_matches_identifier_type" in checks  # restored form
+    assert "mapping_method" not in listing_columns and "raw" not in listing_columns
+
     run_migrations(scratch_database_url)
     check_migrations(scratch_database_url)

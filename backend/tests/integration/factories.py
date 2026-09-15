@@ -48,6 +48,7 @@ from app.models.enums import (
     FileFormat,
     IdentifierType,
     ImportJobStatus,
+    MappingStatus,
     Marketplace,
     SourceSystem,
     SyncStatus,
@@ -147,12 +148,16 @@ def make_identifier(
 def make_marketplace_listing(
     session: Session,
     organization: Organization,
-    product: Product,
+    product: Product | None,
     **kwargs: Any,
 ) -> MarketplaceListing:
+    """A listing. With a product it defaults to PENDING (a product may only be
+    attached through a mapping); without one, UNMAPPED."""
+    default_status = MappingStatus.PENDING if product is not None else MappingStatus.UNMAPPED
     listing = MarketplaceListing(
         organization_id=organization.id,
-        product_id=product.id,
+        product_id=product.id if product is not None else None,
+        mapping_status=kwargs.pop("mapping_status", default_status),
         marketplace=kwargs.pop("marketplace", Marketplace.AMAZON),
         marketplace_id=kwargs.pop("marketplace_id", "ATVPDKIKX0DER"),
         seller_sku=kwargs.pop("seller_sku", unique("SKU")),
@@ -341,12 +346,12 @@ def make_oos_status_history(
 def make_mapping_exception(
     session: Session,
     organization: Organization,
-    vendor: Vendor,
+    vendor: Vendor | None,
     **kwargs: Any,
 ) -> ProductMappingException:
     exception = ProductMappingException(
         organization_id=organization.id,
-        vendor_id=vendor.id,
+        vendor_id=vendor.id if vendor is not None else None,
         reason=kwargs.pop("reason", ExceptionReason.NO_MATCH),
         **kwargs,
     )

@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-15 (Amazon inventory ingestion — POC step 5)
+Last updated: 2026-09-15 (Amazon listings → product mapping — POC step 6)
 
 ---
 
@@ -11,10 +11,10 @@ Last updated: 2026-09-15 (Amazon inventory ingestion — POC step 5)
 |---|---|
 | Milestone | 1 — Data foundation, ingestion, matching |
 | Stage | **Phase 1 complete; phase 3 diagnostic built.** Schema, audit service, configuration/security foundation, and a read-only Nineyard probe exist. Backend is deployed to Railway. |
-| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012), Amazon SP-API configuration, read-only SP-API client, and the orders and inventory ingestion services (`run_orders_sync`, `run_inventory_sync`). No vendor/import/matching logic. |
-| Database schema | 24 tables, 22 enum types, 127 indexes, 74 check constraints, 80 foreign keys, 1 append-only trigger |
-| Migrations | 2 revisions (`506fd0ecc33a`, `3767ee979011`), applied and reversed against PostgreSQL 16.15 |
-| Backend tests | **620 passed** (`pytest`: 442 unit + 178 integration). `git grep -c "def test_"` finds 455 functions (284 unit, 171 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
+| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012), Amazon SP-API configuration, read-only SP-API client, the orders and inventory ingestion services, the listings→product mapping (`map_listings`) and the shared identifier normaliser (`app/matching/normalize.py`). No vendor CRUD or file import yet. |
+| Database schema | 24 tables, 22 enum types, 130 indexes, 78 check constraints, 81 foreign keys, 1 append-only trigger |
+| Migrations | 3 revisions (`506fd0ecc33a`, `3767ee979011`, `3de5c4e5def0`), applied and reversed against PostgreSQL 16.15 |
+| Backend tests | **695 passed** (`pytest`: 496 unit + 199 integration). `git grep -c "def test_"` finds 513 functions (321 unit, 192 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
 | Quality gates | 8 of 8 passing locally **and in GitHub Actions** (§4), 2026-09-14 |
 | Docker stack | **Verified in CI** — full `docker compose up --build` from `.env.example`, API healthy against PostgreSQL, migration applied and checked, web answering (§4, §6 S1). Backend also live on Railway (§6 S2). |
 | Blocking questions open | 8 (see §7); B1 partially answered, B2 narrowed, B7 partially answered by ADR 0011, B8 new |
@@ -34,13 +34,13 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 | — | Planning and documentation | ✅ Complete | Scope, architecture, criteria, 10 ADRs |
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates, GitHub Actions CI (2026-09-14) |
 | 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
-| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | 🟨 Orders and inventory ingestion built | Precedes phase 2 by client request (§10). **Exists:** typed settings, redaction rules, the read-only client, the three tables, `run_orders_sync` ([amazon-integration.md §7](amazon-integration.md)) and `run_inventory_sync` — FBA on-hand and inbound plus FBM quantity from the listings report, append-only snapshots ([§8](amazon-integration.md)). **Does not exist:** listings→product mapping, scheduler, velocity endpoint, CLI. Nothing has run against the real account (B8). |
+| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | 🟨 Ingestion and mapping built | Precedes phase 2 by client request (§10). **Exists:** typed settings, redaction rules, the read-only client, the three tables, `run_orders_sync` ([§7](amazon-integration.md)), `run_inventory_sync` ([§8](amazon-integration.md)) and `map_listings` — seller SKU → product through the §5.1 priority chain only ([§9](amazon-integration.md)). **Does not exist:** scheduler, velocity endpoint, CLI. Nothing has run against the real account (B8). |
 | 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
 | 3 | Nineyard integration + sync | 🟨 Diagnostic only | **Exists:** read-only client (`app/integrations/nineyard/client.py`, `errors.py`, `sanitize.py`), probe (`app/integrations/nineyard/probe.py`), and CLI (`app/cli/nineyard_probe.py`), tested by `tests/unit/test_nineyard_client.py`, `test_nineyard_probe.py`, `test_nineyard_cli.py` (mocked; no live calls). The public OpenAPI spec has been analysed ([nineyard-field-mapping.md](nineyard-field-mapping.md)). **Does not exist:** any sync service — nothing writes Nineyard data to `products`, `product_identifiers`, `marketplace_listings`, `nineyard_sync_runs`, or `nineyard_item_payloads`. The probe has not been run against the live API. See [nineyard-integration.md](nineyard-integration.md) and B1. |
 | 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
 | 5 | File ingestion + raw retention | ⬜ Not started | `import_files` exists; no `StorageBackend` yet |
 | 6 | Parsing + validation + reporting | ⬜ Not started | Needs sample files (B4) |
-| 7 | Matching engine | ⬜ Not started | Schema supports the full priority chain; engine unwritten |
+| 7 | Matching engine | 🟨 Normaliser and listing resolver exist | `app/matching/normalize.py` (AC-7.6) is built and shared; the priority-chain resolver for *listings* is in `amazon_listings.py`. The vendor-row engine and `match_attempt` recording are unwritten. |
 | 8 | Exception workflow | ⬜ Not started | `product_mapping_exceptions` exists; `Principal` now supplies actor identity, so no longer blocked by B2 |
 | 9 | Inventory, availability, watchlist | ⬜ Not started | All four tables exist; no diffing logic |
 | 10 | Admin interface | ⬜ Not started | Shell exists; screens are placeholders. Needs a sign-in flow once B2 settles. |
@@ -150,6 +150,40 @@ vendor of the **same code** in each — which the per-organization unique index
 permits, and which is exactly the shape of a leak — and proves select, update
 and delete stay inside the caller's tenant, including a lookup by the other
 tenant's primary key. Assumption A19 is amended accordingly.
+
+### Amazon listings → product mapping (2026-09-15, POC step 6)
+
+`app/services/amazon_listings.py` is the **first matching code** in the
+repository. It upserts `marketplace_listings` from the merchant listings
+rows and resolves each seller SKU to a product through the CLAUDE.md §5.1
+chain and nothing else: priority 4 (`AMAZON_SKU` identifier → approved
+automatically, approver = a per-organization system user) then priority 1
+(the listing's UPC/EAN, normalised → a **suggestion**, `PENDING` plus a
+`SUGGESTION_ONLY` queue item, because §5.1 row 5 says a person approves
+it); otherwise `UNMAPPED` with a `NO_MATCH`, `AMBIGUOUS_MATCH` or
+`CONFLICTING_IDENTIFIER` queue item carrying every rule tried. `item-name`
+is never an input; an `APPROVED` listing is never modified. Full description
+in [amazon-integration.md §9](amazon-integration.md).
+
+**Three schema corrections were needed first** — the brief and the tables
+disagreed, and the tables were wrong: a listing could not exist without a
+product, an exception could not be about a listing, and an `AMAZON_SKU`
+identifier could not precede its listing. Migration `3de5c4e5def0` fixes all
+three with hand-written check constraints (Alembic does not compare them) and
+a one-step downgrade test ([database-schema.md](database-schema.md)).
+
+`app/matching/normalize.py` (AC-7.6) is new and shared with the vendor
+import: separators stripped, 11-digit UPC-A restored, UPC-E expanded, GTIN
+check digit verified, canonical zero-padded GTIN-14.
+
+**Tests:** 34 normaliser cases (valid UPC-A/EAN-13/EAN-8/GTIN-14, the
+textbook UPC-E, bad check digit, 11-digit, separators, scientific notation),
+20 resolver cases against an in-memory catalog (every branch, ambiguity
+stops the chain, conflicting identifiers, item name never consulted,
+determinism), 7 integration cases asserting the three-row fixture's
+listings, exceptions and audit events exactly plus idempotency, permanence
+of an approved mapping, a later priority-4 hit closing an open queue item,
+and tenant isolation; 12 new constraint/relationship/migration cases.
 
 ### Amazon inventory ingestion (2026-09-15, POC step 5)
 
@@ -353,12 +387,12 @@ file: https://github.com/cbfriedman/Power-BI-Data-Analysis-and-Inventory/actions
 
 | Gate | Command | Result |
 |---|---|---|
-| Backend format | `ruff format .` | ✅ 100 files unchanged |
+| Backend format | `ruff format .` | ✅ 108 files unchanged |
 | Backend lint | `ruff check .` | ✅ All checks passed |
-| Backend types | `mypy` (strict) | ✅ No issues in 97 source files |
-| Backend tests | `pytest` | ✅ `620 passed in 9.85s` — `tests/unit`: `442 passed`; `tests/integration`: `178 passed` |
+| Backend types | `mypy` (strict) | ✅ No issues in 104 source files |
+| Backend tests | `pytest` | ✅ `695 passed in 12.75s` — `tests/unit`: `496 passed`; `tests/integration`: `199 passed` |
 | Migration apply | `alembic upgrade head` | ✅ Both revisions applied to PostgreSQL 16.15 |
-| Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types; one-step downgrade of `3767ee979011` leaves the 21 shared types intact |
+| Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types; one-step downgrades of `3767ee979011` and `3de5c4e5def0` each re-apply cleanly |
 | Migration drift | `alembic check` | ✅ No new upgrade operations detected |
 | Frontend lint | `npm run lint` | ✅ Clean |
 | Frontend types | `npm run typecheck` | ✅ Clean |

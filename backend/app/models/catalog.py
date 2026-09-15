@@ -25,6 +25,7 @@ from app.models.enums import (
     ListingStatus,
     MappingStatus,
     Marketplace,
+    MatchMethod,
     ProductStatus,
     SourceSystem,
 )
@@ -112,13 +113,17 @@ class MarketplaceListing(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Timestamp
     unimplementable and the data unqueryable.
 
     ``mapping_status`` is the approved Amazon-SKU mapping that match priority 4
-    reads. It changes only through an explicit human action (CLAUDE.md §5.2).
+    reads. It changes only through an explicit human action, or through
+    priority 4 itself when the catalog source already names the SKU
+    (CLAUDE.md §5.2). ``product_id`` is set only by a mapping — ``PENDING``
+    carries the candidate a reviewer sees, ``APPROVED`` the permanent link —
+    and is null while ``UNMAPPED``, exactly as on ``vendor_products``.
     """
 
     __tablename__ = "marketplace_listings"
 
-    product_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    product_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=True
     )
     marketplace: Mapped[Marketplace] = mapped_column(
         pg_enum(Marketplace, "marketplace"), nullable=False
@@ -136,13 +141,22 @@ class MarketplaceListing(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Timestamp
         nullable=False,
         server_default=MappingStatus.UNMAPPED.value,
     )
+    # Which rule in the priority chain produced the mapping (CLAUDE.md §5.1).
+    mapping_method: Mapped[MatchMethod | None] = mapped_column(
+        pg_enum(MatchMethod, "match_method"), nullable=True
+    )
     approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     approved_at: Mapped[datetime | None] = mapped_column(nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    # The listing row as the marketplace reported it — the columns the
+    # ingestion chose to keep. Display only; never an input to matching.
+    raw: Mapped[dict[str, Any]] = mapped_column(
+        nullable=False, server_default=text("'{}'::jsonb"), default=dict
+    )
 
-    product: Mapped[Product] = relationship(back_populates="marketplace_listings")
+    product: Mapped[Product | None] = relationship(back_populates="marketplace_listings")
     approved_by: Mapped[User | None] = relationship()
 
     __table_args__ = (
@@ -156,12 +170,27 @@ class MarketplaceListing(UUIDPrimaryKeyMixin, OrganizationScopedMixin, Timestamp
         ),
         Index("ix_marketplace_listings_product_id", "product_id"),
         Index("ix_marketplace_listings_organization_id_asin", "organization_id", "asin"),
+        Index(
+            "ix_marketplace_listings_organization_id_mapping_status",
+            "organization_id",
+            "mapping_status",
+        ),
         # An approved mapping must record who approved it and when. Accountability
         # for a permanent mapping is not optional.
         CheckConstraint(
             "mapping_status <> 'APPROVED'"
             " or (approved_by_user_id is not null and approved_at is not null)",
             name="approved_requires_approver",
+        ),
+        # An approved mapping must point at a product; a product may only be
+        # attached through a real mapping — mirrors vendor_products.
+        CheckConstraint(
+            "mapping_status <> 'APPROVED' or product_id is not null",
+            name="approved_requires_product",
+        ),
+        CheckConstraint(
+            "product_id is null or mapping_status <> 'UNMAPPED'",
+            name="mapped_row_is_not_unmapped",
         ),
         CheckConstraint("length(trim(seller_sku)) > 0", name="seller_sku_not_blank"),
     )
@@ -251,11 +280,15 @@ class ProductIdentifier(UUIDPrimaryKeyMixin, OrganizationScopedMixin, TimestampM
             "normalized_value",
         ),
         Index("ix_product_identifiers_product_id", "product_id"),
+        # An AMAZON_SKU may exist before any listing does: the catalog source
+        # (Nineyard) names the SKU, and the listing arrives later from Amazon.
+        # Unlinked, it is global within the tenant (the first unique index
+        # above) — which is exactly what match priority 4 needs. Linked, it is
+        # scoped to its listing. It never carries a vendor.
         CheckConstraint(
             "(identifier_type = 'VENDOR_SKU' and vendor_id is not null"
             " and marketplace_listing_id is null)"
-            " or (identifier_type = 'AMAZON_SKU' and marketplace_listing_id is not null"
-            " and vendor_id is null)"
+            " or (identifier_type = 'AMAZON_SKU' and vendor_id is null)"
             " or (identifier_type not in ('VENDOR_SKU', 'AMAZON_SKU')"
             " and vendor_id is null and marketplace_listing_id is null)",
             name="context_matches_identifier_type",

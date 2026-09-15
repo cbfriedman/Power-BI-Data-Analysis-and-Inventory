@@ -30,6 +30,7 @@ from app.models import (
     Organization,
     Product,
     ProductIdentifier,
+    ProductMappingException,
     User,
     VendorInventorySnapshot,
 )
@@ -370,3 +371,22 @@ def test_an_order_line_exposes_both_provenance_runs(db_session: Session) -> None
 
     assert line.first_seen_sync_run.id == first.id
     assert line.last_seen_sync_run.id == latest.id
+
+
+def test_deleting_a_listing_removes_its_queue_items(db_session: Session) -> None:
+    """An exception about a listing is part of the listing (CASCADE)."""
+    organization = factories.make_organization(db_session)
+    listing = factories.make_marketplace_listing(db_session, organization, None)
+    factories.make_mapping_exception(
+        db_session, organization, None, marketplace_listing_id=listing.id
+    )
+
+    db_session.execute(delete(MarketplaceListing).where(MarketplaceListing.id == listing.id))
+    db_session.flush()
+
+    remaining = db_session.execute(
+        select(ProductMappingException).where(
+            ProductMappingException.marketplace_listing_id == listing.id
+        )
+    ).all()
+    assert remaining == []

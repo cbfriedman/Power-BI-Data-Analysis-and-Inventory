@@ -1,9 +1,9 @@
 # Amazon SP-API Integration
 
-Status: **Read-only client, tables, orders ingestion and inventory ingestion
-built.** No scheduler, endpoint or CLI exist yet; the listings→product
-mapping is not written. Everything has been exercised only against fakes —
-nothing has run against the real seller account (blocking question **B8**).
+Status: **Read-only client, tables, orders ingestion, inventory ingestion
+and listings→product mapping built.** No scheduler, endpoint or CLI exist
+yet. Everything has been exercised only against fakes — nothing has run
+against the real seller account (blocking question **B8**).
 Last updated: 2026-09-15
 
 ---
@@ -308,14 +308,88 @@ listings rows, `rows_created` = snapshots written, `rows_failed` = listings
 rows rejected + merge failures, `error_details.fbm_only` = how many SKUs
 came only from the report.
 
-The parsed listings rows are handed, in memory, to `listings_sink` when one
-is given — that is the hook for the listings→product mapping, so it needs
-no second report fetch. A named `TODO(prompt-11)` in the service marks
-where the direct call replaces the hook.
+The same parsed listings rows are then handed to the listings→product
+mapping (§9) **inside the same transaction** as the snapshots — one report
+fetch serves both, and a run either lands both or neither. The mapping's
+counts are recorded on the run under `error_details.listings_mapping`.
 
 ---
 
-## 9. What is still unproven
+## 9. Listings → product mapping
+
+`app/services/amazon_listings.py` is the **first matching code in the
+repository**. It populates `marketplace_listings` from the merchant listings
+rows and resolves each seller SKU to a product using the CLAUDE.md §5.1
+priority chain and nothing else. §5.2 governs every line of it:
+
+- a listing resolves through **one rule at a time**, in a fixed order,
+  stopping at the first rule that yields exactly one product; every rule
+  tried and what it returned is recorded in `match_evaluations`;
+- a rule that returns **more than one** product is ambiguous — the listing
+  is queued, no candidate is picked, and no weaker rule is tried;
+- **`item-name` is never an input.** It is stored in `raw` for display and
+  nothing in the resolver reads it; a test proves two listings with the same
+  name and different UPCs resolve to different products, and that a listing
+  with only a name is unmatched;
+- an **APPROVED** listing is permanent: the mapping runs update its
+  `asin`, `listing_status` and `raw` and touch nothing else, even when the
+  catalog now says something different.
+
+### The rules, in the order they run
+
+| Step | Rule | Input | Result when exactly one product |
+|---|---|---|---|
+| 1 | **Priority 4 — `AMAZON_SKU_MAPPING`** | A `product_identifiers` row of type `AMAZON_SKU` whose value is the seller SKU (trimmed, case preserved). This is the catalog source — a future Nineyard `/api/Skus` sync — saying "this SKU is this item". | `mapping_status = APPROVED`, `mapping_method = AMAZON_SKU_MAPPING`, approver = the organization's **system user**, `approved_at = now`; audited as `amazon.listing.mapping_approved`. An open queue item for the listing is resolved `APPROVED` by the system user and audited. |
+| 2 | **Priority 1 — `UPC`** | The listing's `product-id` when `product-id-type` is 3 (UPC) or 4 (EAN), normalised by `app/matching/normalize.py` to GTIN-14 with the check digit verified, against `UPC`/`EAN`/`GTIN` identifiers whose own check digit did not fail. | A **suggestion, not an approval**: `mapping_status = PENDING` with `product_id` = the candidate and `mapping_method = UPC`, plus a queue item with reason `SUGGESTION_ONLY`. An Amazon-SKU link inferred from a UPC still needs a person (§5.1 row 5). |
+| — | Otherwise | | `mapping_status = UNMAPPED`, `product_id` null, and a queue item: `AMBIGUOUS_MATCH` when a rule returned several products, `CONFLICTING_IDENTIFIER` when priority 4 and priority 1 each returned one product and they differ, `NO_MATCH` when nothing fired. |
+
+Priority 4 is evaluated first because it is the direct evidence; priority 1
+is evaluated as well, always, so the attribution is complete. A bad check
+digit never reaches the catalog — the rule is recorded as `skipped` with the
+reason. `REJECTED` and `SUPERSEDED` listings are left alone (re-running the
+chain would re-queue a rejected suggestion unchanged, AC-8.5); phase 8 owns
+what happens next for those.
+
+### What lands in the database
+
+- `marketplace_listings`: one row per `(organization, AMAZON, marketplace_id,
+  seller_sku)`, upserted with `asin`, `listing_status` (Active → `ACTIVE`,
+  Inactive/Incomplete → `INACTIVE`, else `UNKNOWN`) and `raw` — the eight
+  retained columns of the report row.
+- `product_mapping_exceptions`: **one open item per listing** (partial unique
+  index). A re-run refreshes the open item's reason, candidates and
+  evaluations in place rather than adding a second.
+  `candidates.products[]` lists every product any rule returned with the rule,
+  priority and identifier that produced it; `match_evaluations.rules[]` is the
+  full ordered trace.
+- `audit_events`: `amazon.listing.mapping_approved` (before/after of the
+  listing), `amazon.listing.exception_opened`, and
+  `amazon.listing.exception_resolved` — all `SYSTEM`, labelled
+  `amazon-listings-mapping`.
+- `users`: the per-organization system user `system@prms.internal`, created
+  on first use, no password, no roles — it can be named as an approver and
+  can never sign in.
+
+### Schema corrections this needed
+
+Migration `3de5c4e5def0` ([database-schema.md](database-schema.md)): a
+listing may now exist without a product (with the same two checks
+`vendor_products` has), an exception may be about a listing instead of a
+vendor, and an `AMAZON_SKU` identifier may exist before its listing does.
+
+### Normalisation
+
+`app/matching/normalize.py` is shared with the vendor import (Track B) and
+implements AC-7.6: strip whitespace and separators, digits only, restore the
+leading zero on an 11-digit UPC-A, expand UPC-E, verify the GTIN check
+digit, and compare in canonical zero-padded GTIN-14. Values differing only in
+leading zeros compare equal; a bad check digit is reported and disqualifies
+the value from automatic matching; a spreadsheet's `1.23457E+11` is unusable
+rather than "close enough".
+
+---
+
+## 10. What is still unproven
 
 The client has run only against fakes. Until B8 is answered and the probe
 step runs it against the real account, these remain assumptions:

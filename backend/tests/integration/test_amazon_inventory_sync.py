@@ -15,14 +15,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.integrations.amazon import InventorySummary
-from app.models import AmazonInventorySnapshot, AmazonSyncRun, AuditEvent
+from app.models import AmazonInventorySnapshot, AmazonSyncRun, AuditEvent, MarketplaceListing
 from app.models.enums import ActorType, AmazonSyncJobType, SyncStatus, TriggerType
 from app.services.amazon_inventory import (
     AUDIT_ACTION_COMPLETED,
     AUDIT_ACTION_FAILED,
     LISTINGS_REPORT_TYPE,
     InventorySyncAlreadyRunning,
-    ParsedListing,
     run_inventory_sync,
 )
 from tests.integration import factories
@@ -141,7 +140,8 @@ def test_one_snapshot_per_sku_with_fba_and_fbm_merged(db_session: Session) -> No
     assert run.rows_seen == len(SUMMARIES) + 6  # summaries + listings rows
     assert run.rows_created == len(EXPECTED_SKUS)
     assert (run.rows_updated, run.rows_unchanged, run.rows_failed) == (0, 0, 0)
-    assert run.error_details == {"fbm_only": 4}
+    assert run.error_details["fbm_only"] == 4
+    assert run.error_details["listings_mapping"]["listings_seen"] == 6
     assert client.report_requests == [LISTINGS_REPORT_TYPE]
 
     snapshots = snapshots_for(db_session, run)
@@ -205,13 +205,21 @@ def test_snapshots_are_append_only_across_runs(db_session: Session) -> None:
     assert len(total) == len(before) + len(after)
 
 
-def test_the_listings_sink_receives_the_parsed_rows(db_session: Session) -> None:
+def test_listings_are_mapped_in_the_same_run(db_session: Session) -> None:
+    """Every parsed listings row becomes a marketplace_listings row, in the
+    same transaction as the snapshots (mapping itself is tested in
+    test_amazon_listings_mapping.py)."""
     organization = factories.make_organization(db_session)
-    received: list[Sequence[ParsedListing]] = []
 
-    sync(db_session, organization.id, FakeClient(), listings_sink=received.append)
+    run = sync(db_session, organization.id, FakeClient())
 
-    [listings] = received
+    listings = (
+        db_session.execute(
+            select(MarketplaceListing).where(MarketplaceListing.organization_id == organization.id)
+        )
+        .scalars()
+        .all()
+    )
     assert {listing.seller_sku for listing in listings} == {
         "WIDGET-12",
         "GADGET-1",
@@ -220,6 +228,11 @@ def test_the_listings_sink_receives_the_parsed_rows(db_session: Session) -> None
         "UPC-1",
         "CAFE-1",
     }
+    mapping = run.error_details["listings_mapping"]
+    assert mapping["listings_created"] == 6
+    # No catalog was seeded, so nothing could resolve; every row is queued.
+    assert mapping["unmapped"] == 6
+    assert mapping["exceptions_opened"] == 6
 
 
 def test_rejected_listing_rows_complete_with_errors(db_session: Session) -> None:

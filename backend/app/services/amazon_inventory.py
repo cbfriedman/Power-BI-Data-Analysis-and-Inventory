@@ -17,8 +17,9 @@ Two reads feed one snapshot per SKU:
    quantity. A SKU that appears only here — FBM-only, never sent to FBA —
    gets a snapshot with zero FBA quantities and the FBM quantity.
 
-The listings rows are also what the listings→product mapping needs, so
-they are handed to ``listings_sink`` when one is given. The same
+The listings rows are also what the listings→product mapping needs
+(:mod:`app.services.amazon_listings`), so the same parsed rows feed it in the
+same transaction — one report fetch serves both. The same
 run/transaction/audit shape as :mod:`app.services.amazon_orders`.
 """
 
@@ -41,6 +42,7 @@ from app.db.transaction import transaction
 from app.integrations.amazon import AmazonClient, AmazonConfig, InventorySummary
 from app.models.amazon import AmazonInventorySnapshot, AmazonSyncRun
 from app.models.enums import AmazonSyncJobType, SyncStatus, TriggerType
+from app.services.amazon_listings import map_listings
 from app.services.amazon_orders import decode_report
 from app.services.amazon_runs import SyncAlreadyRunning, close_run, fail_run, open_run
 
@@ -416,14 +418,12 @@ def run_inventory_sync(
     client: InventorySource | None = None,
     *,
     marketplace_id: str | None = None,
-    listings_sink: Callable[[Sequence[ParsedListing]], None] | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> AmazonSyncRun:
     """Perform one inventory ingestion run and return its closed run record.
 
-    ``listings_sink`` receives every parsed listings row, in memory, for the
-    listings→product mapping. Until that service exists the rows are only
-    used for FBM quantities.
+    The parsed listings rows feed both the FBM quantities on the snapshots
+    and the listings→product mapping, in the same transaction.
 
     Raises :class:`InventorySyncAlreadyRunning` if a run is in flight, and
     otherwise re-raises whatever stopped the run — after the run row has been
@@ -470,13 +470,6 @@ def run_inventory_sync(
             encoding=listings.encoding,
         )
 
-        # TODO(prompt-11): replace this hook with a direct call to the listings
-        # mapping service once app/services/amazon_listings.py exists; the
-        # parsed rows are kept in memory here precisely so that call needs no
-        # second report fetch.
-        if listings_sink is not None:
-            listings_sink(listings.listings)
-
         merged = merge_snapshot_rows(summaries, listings.listings)
         rows_failed = listings.rows_failed + merged.rows_failed
         errors = listings.errors + merged.errors
@@ -488,6 +481,15 @@ def run_inventory_sync(
                 sync_run_id=run.id,
                 captured_at=started_at,
                 rows=merged.rows,
+            )
+            # The same parsed rows, one transaction: listings are upserted and
+            # resolved through the priority chain, or not at all.
+            mapping = map_listings(
+                session,
+                organization_id,
+                listings.listings,
+                marketplace_id=marketplace_id,
+                now=lambda: started_at,
             )
             close_run(
                 session,
@@ -501,11 +503,11 @@ def run_inventory_sync(
                 rows_updated=0,
                 rows_unchanged=0,
                 rows_failed=rows_failed,
-                error_details=(
-                    {"rows": errors[:100], "fbm_only": merged.fbm_only}
-                    if errors
-                    else {"fbm_only": merged.fbm_only}
-                ),
+                error_details={
+                    **({"rows": errors[:100]} if errors else {}),
+                    "fbm_only": merged.fbm_only,
+                    "listings_mapping": mapping.as_json(),
+                },
             )
     except BaseException as exc:
         failure = exc

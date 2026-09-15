@@ -18,6 +18,7 @@ from app.models.enums import (
     AmazonSyncJobType,
     AvailabilityEventType,
     AvailabilityStatus,
+    ExceptionReason,
     ExceptionStatus,
     FileFormat,
     IdentifierType,
@@ -969,3 +970,188 @@ def test_inventory_snapshot_sku_cannot_be_blank(db_session: Session) -> None:
 
     with pytest.raises(IntegrityError):
         factories.make_amazon_inventory_snapshot(db_session, organization, run, seller_sku=" ")
+
+
+# --- Marketplace listing mapping state (3de5c4e5def0) --------------------------------
+
+
+def test_an_approved_listing_must_point_at_a_product(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    user = factories.make_user(db_session, organization)
+
+    with pytest.raises(IntegrityError):
+        factories.make_marketplace_listing(
+            db_session,
+            organization,
+            None,
+            mapping_status=MappingStatus.APPROVED,
+            approved_by_user_id=user.id,
+            approved_at=datetime.now(UTC),
+        )
+
+
+def test_a_product_cannot_be_attached_to_an_unmapped_listing(db_session: Session) -> None:
+    """Mirrors vendor_products: a product arrives only through a mapping."""
+    organization = factories.make_organization(db_session)
+    product = factories.make_product(db_session, organization)
+
+    with pytest.raises(IntegrityError):
+        factories.make_marketplace_listing(
+            db_session, organization, product, mapping_status=MappingStatus.UNMAPPED
+        )
+
+
+def test_an_unmapped_listing_without_a_product_is_accepted(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+
+    listing = factories.make_marketplace_listing(db_session, organization, None)
+    db_session.refresh(listing)
+
+    assert listing.product_id is None
+    assert listing.mapping_status is MappingStatus.UNMAPPED
+
+
+def test_a_pending_listing_may_carry_its_candidate(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    product = factories.make_product(db_session, organization)
+
+    listing = factories.make_marketplace_listing(
+        db_session, organization, product, mapping_status=MappingStatus.PENDING
+    )
+
+    assert listing.product_id == product.id
+
+
+# --- AMAZON_SKU identifiers may precede their listing -----------------------------------
+
+
+def test_an_amazon_sku_identifier_may_exist_without_a_listing(db_session: Session) -> None:
+    """The catalog source names the SKU before Amazon reports the listing."""
+    organization = factories.make_organization(db_session)
+    product = factories.make_product(db_session, organization)
+
+    identifier = factories.make_identifier(
+        db_session,
+        organization,
+        product,
+        identifier_type=IdentifierType.AMAZON_SKU,
+        normalized_value="SKU-EARLY",
+    )
+
+    assert identifier.marketplace_listing_id is None
+
+
+def test_an_unlinked_amazon_sku_resolves_to_one_product_per_organization(
+    db_session: Session,
+) -> None:
+    """Two products claiming the same SKU would make priority 4 ambiguous by
+    construction; the global unique index forbids it."""
+    organization = factories.make_organization(db_session)
+    first = factories.make_product(db_session, organization)
+    second = factories.make_product(db_session, organization)
+    factories.make_identifier(
+        db_session,
+        organization,
+        first,
+        identifier_type=IdentifierType.AMAZON_SKU,
+        normalized_value="SKU-TWICE",
+    )
+
+    with pytest.raises(IntegrityError):
+        factories.make_identifier(
+            db_session,
+            organization,
+            second,
+            identifier_type=IdentifierType.AMAZON_SKU,
+            normalized_value="SKU-TWICE",
+        )
+
+
+def test_an_amazon_sku_identifier_still_cannot_carry_a_vendor(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    product = factories.make_product(db_session, organization)
+    vendor = factories.make_vendor(db_session, organization)
+
+    with pytest.raises(IntegrityError):
+        factories.make_identifier(
+            db_session,
+            organization,
+            product,
+            identifier_type=IdentifierType.AMAZON_SKU,
+            normalized_value="SKU-V",
+            vendor_id=vendor.id,
+        )
+
+
+# --- Exceptions about a marketplace listing ----------------------------------------------
+
+
+def test_an_exception_must_be_about_something(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+
+    with pytest.raises(IntegrityError):
+        factories.make_mapping_exception(db_session, organization, None)
+
+
+def test_an_exception_about_a_listing_needs_no_vendor(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    listing = factories.make_marketplace_listing(db_session, organization, None)
+
+    exception = factories.make_mapping_exception(
+        db_session, organization, None, marketplace_listing_id=listing.id
+    )
+
+    assert exception.vendor_id is None
+    assert exception.marketplace_listing_id == listing.id
+
+
+def test_a_vendor_product_exception_still_needs_its_vendor(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    vendor = factories.make_vendor(db_session, organization)
+    vendor_product = factories.make_vendor_product(db_session, organization, vendor)
+    listing = factories.make_marketplace_listing(db_session, organization, None)
+
+    with pytest.raises(IntegrityError):
+        factories.make_mapping_exception(
+            db_session,
+            organization,
+            None,
+            marketplace_listing_id=listing.id,
+            vendor_product_id=vendor_product.id,
+        )
+
+
+def test_only_one_pending_exception_per_listing(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    listing = factories.make_marketplace_listing(db_session, organization, None)
+    factories.make_mapping_exception(
+        db_session, organization, None, marketplace_listing_id=listing.id
+    )
+
+    with pytest.raises(IntegrityError):
+        factories.make_mapping_exception(
+            db_session,
+            organization,
+            None,
+            marketplace_listing_id=listing.id,
+            reason=ExceptionReason.AMBIGUOUS_MATCH,
+        )
+
+
+def test_a_resolved_listing_exception_frees_the_queue_slot(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    user = factories.make_user(db_session, organization)
+    listing = factories.make_marketplace_listing(db_session, organization, None)
+    factories.make_mapping_exception(
+        db_session,
+        organization,
+        None,
+        marketplace_listing_id=listing.id,
+        status=ExceptionStatus.REJECTED,
+        resolved_by_user_id=user.id,
+        resolved_at=datetime.now(UTC),
+    )
+
+    factories.make_mapping_exception(
+        db_session, organization, None, marketplace_listing_id=listing.id
+    )

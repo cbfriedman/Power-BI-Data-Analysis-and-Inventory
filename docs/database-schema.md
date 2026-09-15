@@ -1,11 +1,11 @@
 # Database Schema — Milestone 1
 
-Status: **Implemented.** Migrations `506fd0ecc33a` (initial schema) and
-`3767ee979011` (Amazon ingestion, ADR 0011) applied and verified against
-PostgreSQL 16.
+Status: **Implemented.** Migrations `506fd0ecc33a` (initial schema),
+`3767ee979011` (Amazon ingestion, ADR 0011) and `3de5c4e5def0` (listing
+mapping context) applied and verified against PostgreSQL 16.
 Last updated: 2026-09-15
 
-24 tables, 22 native enum types, 127 indexes, 74 check constraints, 80 foreign
+24 tables, 22 native enum types, 130 indexes, 78 check constraints, 81 foreign
 keys, and one append-only trigger. The authoritative definition is
 [backend/app/models/](../backend/app/models/); this document explains the shape
 and the reasoning.
@@ -71,6 +71,7 @@ erDiagram
     IMPORT_JOBS |o--o{ PRODUCT_MAPPING_EXCEPTIONS : "raises"
     IMPORT_JOB_ROWS |o--o{ PRODUCT_MAPPING_EXCEPTIONS : "from row"
     VENDOR_PRODUCTS |o--o{ PRODUCT_MAPPING_EXCEPTIONS : "about"
+    MARKETPLACE_LISTINGS |o--o{ PRODUCT_MAPPING_EXCEPTIONS : "about"
     PRODUCTS |o--o{ PRODUCT_MAPPING_EXCEPTIONS : "resolved to"
 
     NINEYARD_SYNC_RUNS ||--o{ SOURCE_RECORDS : "retains payloads"
@@ -145,13 +146,16 @@ erDiagram
     MARKETPLACE_LISTINGS {
         uuid id PK
         uuid organization_id FK
-        uuid product_id FK
+        uuid product_id FK "null while UNMAPPED"
         enum marketplace
         text marketplace_id
         text seller_sku "one row per SKU"
         text asin
+        enum listing_status
         enum mapping_status "approved = match priority 4"
+        enum mapping_method
         uuid approved_by_user_id FK
+        jsonb raw "display only"
     }
 
     VENDORS {
@@ -264,6 +268,7 @@ erDiagram
         uuid organization_id FK
         uuid import_job_id FK
         uuid vendor_product_id FK "one PENDING per vendor line"
+        uuid marketplace_listing_id FK "one PENDING per listing"
         enum reason
         enum status "PENDING, APPROVED, REJECTED"
         uuid suggested_product_id FK
@@ -506,9 +511,19 @@ pending in the exception queue.
 
 ### 3.6 Exception queue
 
-`uq_product_mapping_exceptions_pending_vendor_product` is partial on
-`status = 'PENDING'`: re-importing an unresolvable SKU cannot pile up duplicate
-queue items, and resolving one frees the slot.
+An exception is about **one of two subjects**: a vendor line (`vendor_id`,
+optionally `vendor_product_id`) or a marketplace listing
+(`marketplace_listing_id`). `ck_…_has_a_subject` requires at least one, and
+`ck_…_vendor_product_requires_vendor` keeps a vendor line attached to its
+vendor. `vendor_id` became nullable in `3de5c4e5def0` for exactly this reason:
+an Amazon listing has no vendor.
+
+`uq_product_mapping_exceptions_pending_vendor_product` and
+`uq_product_mapping_exceptions_pending_listing` are partial on
+`status = 'PENDING'`: re-importing an unresolvable SKU, or re-running the
+listings mapping, cannot pile up duplicate queue items, and resolving one
+frees the slot. An exception about a listing is deleted with the listing
+(`CASCADE`).
 
 Check constraints make the state machine real:
 
@@ -622,6 +637,30 @@ each in a named helper at the top of the file:
    that forgets them leaves the database in a state where the next upgrade fails
    with "type already exists". That failure would only ever surface in a real
    deployment, so a test asserts the round trip explicitly.
+
+### `3de5c4e5def0` — listing mapping context
+
+Three corrections the Amazon listings mapping (ADR 0011) needed, none of
+which autogenerate can express, so each is hand-written and covered by a
+one-step downgrade test:
+
+1. **`marketplace_listings`** gains `mapping_method`, `raw`, a nullable
+   `product_id`, and the two checks `vendor_products` already had —
+   `approved_requires_product` and `mapped_row_is_not_unmapped`. Before this
+   a listing could not exist without a product, which made "unmapped"
+   unrepresentable.
+2. **`product_mapping_exceptions`** gains `marketplace_listing_id` (CASCADE),
+   a nullable `vendor_id`, the `has_a_subject` and
+   `vendor_product_requires_vendor` checks, and the one-PENDING-per-listing
+   partial index.
+3. **`product_identifiers.context_matches_identifier_type`** is rewritten so
+   an `AMAZON_SKU` may exist *without* a listing — the catalog source names
+   the SKU before Amazon reports the listing. Unlinked, it falls under the
+   global unique index, which is what makes match priority 4 unambiguous.
+
+The downgrade deletes the rows the old schema cannot hold (listings without
+a product, exceptions without a vendor, unlinked `AMAZON_SKU` identifiers)
+before re-tightening `NOT NULL`, deliberately and in the migration text.
 
 ### `3767ee979011` — Amazon sync runs, order lines and inventory snapshots
 
