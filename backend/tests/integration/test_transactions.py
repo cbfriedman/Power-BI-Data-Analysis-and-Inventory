@@ -91,6 +91,27 @@ class TestCommitOnSuccess:
 
         assert db_session.get(Organization, survivor.id) is not None
 
+    def test_a_failure_at_commit_time_is_rolled_back_too(self, db_session: Session) -> None:
+        """The flush can happen *at* commit, not in the body — it must still roll back.
+
+        Found by the Amazon orders sync: ``session.add(run)`` then commit, with
+        the constraint violation surfacing inside ``commit()``. With commit in
+        an ``else`` branch the session was left pending-rollback and every
+        later statement failed.
+        """
+        organization = factories.make_organization(db_session, slug="commit-time")
+        db_session.commit()
+
+        with pytest.raises(IntegrityError), transaction(db_session):
+            # add() only — no flush until commit().
+            db_session.add(Organization(name="dup", slug=organization.slug))
+
+        # The session must be usable, and the earlier row untouched.
+        with transaction(db_session):
+            survivor = factories.make_organization(db_session, slug="after-commit-failure")
+        assert db_session.get(Organization, survivor.id) is not None
+        assert db_session.get(Organization, organization.id) is not None
+
 
 class TestSavepoints:
     def test_an_inner_failure_leaves_the_outer_transaction_intact(

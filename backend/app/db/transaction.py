@@ -34,15 +34,20 @@ def transaction(session: Session) -> Iterator[Session]:
             audit.record(session, action="vendor.deactivated", ...)
 
     Both writes land, or neither does.
+
+    ``commit()`` sits inside the ``try``: an object added in the body and
+    flushed only at commit time can fail *there* — a duplicate key, a value
+    too long for its column — and that failure must roll the session back
+    just like one raised in the body. Leaving it in an ``else`` branch leaves
+    the session in a pending-rollback state that poisons every later use.
     """
     try:
         yield session
+        session.commit()
     except Exception:
         session.rollback()
         _logger.warning("transaction.rolled_back", exc_info=True)
         raise
-    else:
-        session.commit()
 
 
 @contextmanager
@@ -56,6 +61,9 @@ def savepoint(session: Session) -> Iterator[Session]:
     nested = session.begin_nested()
     try:
         yield session
+        # Inside the try for the same reason as in transaction(): the flush
+        # that releases the savepoint can be the thing that fails.
+        nested.commit()
     except Exception:
         # Unconditional. A failed flush leaves the nested transaction *inactive*,
         # and rolling it back is precisely how the session is made usable again —
@@ -63,8 +71,6 @@ def savepoint(session: Session) -> Iterator[Session]:
         # transaction dies with a PendingRollbackError instead.
         nested.rollback()
         raise
-    else:
-        nested.commit()
 
 
 @contextmanager

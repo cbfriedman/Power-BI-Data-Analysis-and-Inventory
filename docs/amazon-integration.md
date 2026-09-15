@@ -1,9 +1,9 @@
 # Amazon SP-API Integration
 
-Status: **Read-only client built; nothing calls it yet.** No ingestion,
-tables, scheduler, endpoint or CLI exist. The client has been exercised only
-against fakes — it has not been run against the real seller account
-(blocking question **B8**).
+Status: **Read-only client, tables, and the orders ingestion built.** No
+scheduler, endpoint or CLI exist yet; inventory and listings ingestion are
+not written. Everything has been exercised only against fakes — nothing has
+run against the real seller account (blocking question **B8**).
 Last updated: 2026-09-15
 
 ---
@@ -175,7 +175,95 @@ cap, `Retry-After`, exhaustion, and the polling timeout without waiting.
 
 ---
 
-## 7. What is still unproven
+## 7. Orders ingestion
+
+`app/services/amazon_orders.py` is the first consumer of the client. One
+call, `run_orders_sync(session, organization_id, window_start, window_end,
+trigger_type, triggered_by_user_id=None, client=None)`, performs one run and
+returns its closed `AmazonSyncRun`.
+
+### The run, step by step
+
+1. **Validate the window.** Timezone-aware UTC, end after start, end not in
+   the future, and at most `MAX_WINDOW_DAYS` (30) long — Amazon's limit for
+   this report, refused here with a message that says so.
+   `trailing_window(days=30)` gives the scheduler `[now - 30d, now]`.
+2. **Claim the slot.** A `RUNNING` row is inserted and committed in its own
+   transaction before anything else happens. The partial unique index
+   `uq_amazon_sync_runs_running_job` is the lock: a second attempt raises
+   `OrdersSyncAlreadyRunning` and fetches nothing.
+3. **Fetch.** `client.fetch_report("GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL", …)`
+   — request, poll, download, through the read-only client.
+4. **Parse** (below).
+5. **Upsert and close, in one transaction.** Lines are upserted, the run is
+   set to `COMPLETED` (or `COMPLETED_WITH_ERRORS` when any row was
+   rejected) with its five counts, and an audit event
+   `amazon.orders_sync.completed` is recorded with actor type `SYSTEM` — all
+   in the same transaction (ADR 0006).
+6. **On any failure**, the run is closed as `FAILED` in a fresh transaction
+   with the exception class and message in `error_details`, audited as
+   `amazon.orders_sync.failed`, and the exception is re-raised. This is a
+   `try/except/finally`: a run row can end `RUNNING` only if the process
+   dies between the claim and the `finally`.
+
+### Parsing the report
+
+The flat file is read with the `csv` module (tab delimiter), decoded as
+UTF-8 (BOM tolerated) with a fallback to Latin-1. Twelve columns are
+required — `amazon-order-id`, `purchase-date`, `last-updated-date`,
+`order-status`, `fulfillment-channel`, `sales-channel`, `sku`, `asin`,
+`item-status`, `quantity`, `currency`, `item-price` — and a report missing
+any of them fails the run with the missing names in the message.
+
+**The `ship-*` columns are never read.** The retained `raw` dict is built
+from the required-column list, not from the row, so `ship-city`,
+`ship-state`, `ship-postal-code` and `ship-country` (and `product-name`)
+cannot reach the database by accident. A unit test asserts `raw` holds
+exactly the twelve columns; a schema test asserts the table has no
+PII-shaped column.
+
+Rows are **aggregated per `(amazon-order-id, sku)`** — the report has no
+order-item id, and one order can list the same SKU twice. Quantities are
+summed; statuses, price and timestamps come from the line with the latest
+`last-updated-date`. Timestamps are parsed as ISO 8601 and normalised to
+UTC. A row that cannot be interpreted (a non-integer quantity, a blank SKU,
+an unparseable date) is counted in `rows_failed` and described in
+`error_details.rows` with its row number; the rest of the report still
+loads. A price without a currency is dropped rather than stored, because
+the table's check forbids the pair.
+
+### The upsert
+
+`INSERT … ON CONFLICT (organization_id, amazon_order_id, seller_sku) DO
+UPDATE`, in batches of 500, with two rules enforced in SQL *and* counted in
+Python:
+
+- data columns change only when the incoming `last_updated_at` is **newer**
+  than the stored one (`CASE WHEN excluded.last_updated_at >
+  amazon_order_lines.last_updated_at …`) — re-running an old window cannot
+  regress a line;
+- `last_seen_sync_run_id` is set on every line the report contained,
+  changed or not; `first_seen_sync_run_id` is never touched after insert.
+
+Counts (`rows_created` / `rows_updated` / `rows_unchanged`) come from a
+read of the existing keys in the same transaction; the one-`RUNNING`-run
+index is what makes that read safe.
+
+### A defect this work found in the foundation
+
+`app/db/transaction.py` had `session.commit()` in an `else` branch. A
+constraint violation raised *by the commit itself* — an object added in the
+body and first flushed at commit time — was therefore never rolled back,
+and the session was left in a pending-rollback state that failed every
+later statement. The orders sync hit it on its second call. `commit()` now
+sits inside the `try` in both `transaction()` and `savepoint()`, and a
+regression test in `test_transactions.py` covers the commit-time path.
+Phase 2's vendor CRUD would have found the same defect on its first
+duplicate code.
+
+---
+
+## 8. What is still unproven
 
 The client has run only against fakes. Until B8 is answered and the probe
 step runs it against the real account, these remain assumptions:
@@ -188,7 +276,10 @@ step runs it against the real account, these remain assumptions:
 - the real throttling behaviour under a first 30-day backfill of order
   lines, and whether `Retry-After` is sent;
 - the charset Amazon declares for this seller's flat-file reports (the
-  library decodes with a fallback of ISO-8859-1 if none is declared).
+  library decodes with a fallback of ISO-8859-1 if none is declared);
+- the exact column set and timestamp format of the live orders report — the
+  parser's fixture follows Amazon's documentation, and the required twelve
+  columns are checked on every run, but the report has not been pulled.
 
 Each is recorded when observed, in the same way
 [nineyard-field-mapping.md](nineyard-field-mapping.md) records Nineyard
