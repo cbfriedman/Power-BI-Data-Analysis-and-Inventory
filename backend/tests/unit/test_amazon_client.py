@@ -576,6 +576,36 @@ class TestInventoryPagination:
         assert all(kwargs["details"] is True for _, _, kwargs in recorder.calls)
         assert all(kwargs["marketplaceIds"] == ["ATVPDKIKX0DER"] for _, _, kwargs in recorder.calls)
 
+    def test_a_page_delay_is_slept_between_pages_only(
+        self, client: AmazonClient, recorder: Recorder, clock: FakeClock
+    ) -> None:
+        """Not before the first page, not after the last: two sleeps for three pages."""
+        recorder.script = [
+            lambda: inventory_page([INVENTORY_ITEM_MINIMAL], "tok-2"),
+            lambda: inventory_page([INVENTORY_ITEM_MINIMAL], "tok-3"),
+            lambda: inventory_page([INVENTORY_ITEM_MINIMAL]),
+        ]
+
+        list(client.iter_inventory_summaries(page_delay_s=0.6))
+
+        assert clock.sleeps == [0.6, 0.6]
+
+    def test_no_page_delay_by_default(
+        self, client: AmazonClient, recorder: Recorder, clock: FakeClock
+    ) -> None:
+        recorder.script = [
+            lambda: inventory_page([INVENTORY_ITEM_MINIMAL], "tok-2"),
+            lambda: inventory_page([INVENTORY_ITEM_MINIMAL]),
+        ]
+
+        list(client.iter_inventory_summaries())
+
+        assert clock.sleeps == []
+
+    def test_a_negative_page_delay_is_refused(self, client: AmazonClient) -> None:
+        with pytest.raises(ValueError, match="page_delay_s"):
+            list(client.iter_inventory_summaries(page_delay_s=-1))
+
     def test_details_can_be_switched_off(self, client: AmazonClient, recorder: Recorder) -> None:
         recorder.script = [lambda: inventory_page([])]
 

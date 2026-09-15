@@ -38,17 +38,15 @@ from typing import Any, Final, Protocol
 
 from sqlalchemy import case, select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.context import get_request_id
 from app.core.logging import get_logger
 from app.db.transaction import transaction
 from app.integrations.amazon import AmazonClient, AmazonConfig
 from app.models.amazon import AmazonOrderLine, AmazonSyncRun
-from app.models.enums import ActorType, AmazonSyncJobType, SyncStatus, TriggerType
-from app.services import audit
+from app.models.enums import AmazonSyncJobType, SyncStatus, TriggerType
+from app.services.amazon_runs import SyncAlreadyRunning, close_run, fail_run, open_run
 
 _logger = get_logger(__name__)
 
@@ -88,7 +86,7 @@ class OrdersSyncError(Exception):
     """A run could not be performed. The run row, if one exists, is FAILED."""
 
 
-class OrdersSyncAlreadyRunning(OrdersSyncError):  # noqa: N818 — state, not a fault
+class OrdersSyncAlreadyRunning(OrdersSyncError, SyncAlreadyRunning):  # noqa: N818
     """Another ORDERS_REPORT run is still RUNNING for this organization."""
 
 
@@ -481,24 +479,20 @@ def run_orders_sync(
         client = AmazonClient(AmazonConfig.from_settings(settings))
     marketplace_id = marketplace_id or settings.amazon_marketplace_id
 
-    run = _open_run(
-        session,
-        organization_id=organization_id,
-        window_start=window_start,
-        window_end=window_end,
-        marketplace_id=marketplace_id,
-        trigger_type=trigger_type,
-        triggered_by_user_id=triggered_by_user_id,
-        started_at=started_at,
-    )
-    _logger.info(
-        "amazon.orders_sync.started",
-        run_id=str(run.id),
-        organization_id=str(organization_id),
-        window_start=window_start.isoformat(),
-        window_end=window_end.isoformat(),
-        trigger_type=trigger_type.value,
-    )
+    try:
+        run = open_run(
+            session,
+            organization_id=organization_id,
+            job_type=AmazonSyncJobType.ORDERS_REPORT,
+            trigger_type=trigger_type,
+            marketplace_id=marketplace_id,
+            started_at=started_at,
+            window_start=window_start,
+            window_end=window_end,
+            triggered_by_user_id=triggered_by_user_id,
+        )
+    except SyncAlreadyRunning as exc:
+        raise OrdersSyncAlreadyRunning(str(exc)) from exc
 
     failure: BaseException | None = None
     try:
@@ -521,12 +515,14 @@ def run_orders_sync(
                 marketplace_id=marketplace_id,
                 lines=parsed.lines,
             )
-            _close_run(
+            close_run(
                 session,
                 run,
                 status=(
                     SyncStatus.COMPLETED_WITH_ERRORS if parsed.rows_failed else SyncStatus.COMPLETED
                 ),
+                audit_action=AUDIT_ACTION_COMPLETED,
+                actor_label=AUDIT_ACTOR_LABEL,
                 completed_at=now(),
                 rows_seen=parsed.rows_seen,
                 rows_created=counts.created,
@@ -540,7 +536,14 @@ def run_orders_sync(
         raise
     finally:
         if run.status is SyncStatus.RUNNING:
-            _fail_run(session, run, failure, completed_at=now())
+            fail_run(
+                session,
+                run,
+                failure,
+                completed_at=now(),
+                audit_action=AUDIT_ACTION_FAILED,
+                actor_label=AUDIT_ACTOR_LABEL,
+            )
 
     _logger.info(
         "amazon.orders_sync.completed",
@@ -553,100 +556,3 @@ def run_orders_sync(
         rows_failed=run.rows_failed,
     )
     return run
-
-
-def _open_run(
-    session: Session,
-    *,
-    organization_id: uuid.UUID,
-    window_start: datetime,
-    window_end: datetime,
-    marketplace_id: str,
-    trigger_type: TriggerType,
-    triggered_by_user_id: uuid.UUID | None,
-    started_at: datetime,
-) -> AmazonSyncRun:
-    """Claim the RUNNING slot in its own transaction, released immediately.
-
-    The partial unique index on (organization_id, job_type) WHERE RUNNING is
-    the lock; an IntegrityError here means another run holds it.
-    """
-    run = AmazonSyncRun(
-        organization_id=organization_id,
-        job_type=AmazonSyncJobType.ORDERS_REPORT,
-        status=SyncStatus.RUNNING,
-        trigger_type=trigger_type,
-        window_start=window_start,
-        window_end=window_end,
-        marketplace_id=marketplace_id,
-        started_at=started_at,
-        triggered_by_user_id=triggered_by_user_id,
-        request_id=get_request_id(),
-    )
-    try:
-        with transaction(session):
-            session.add(run)
-    except IntegrityError as exc:
-        raise OrdersSyncAlreadyRunning(
-            f"an ORDERS_REPORT run is already RUNNING for organization {organization_id}"
-        ) from exc
-    return run
-
-
-def _close_run(session: Session, run: AmazonSyncRun, *, status: SyncStatus, **fields: Any) -> None:
-    """Set the final state and audit it. Caller owns the transaction."""
-    for name, value in fields.items():
-        setattr(run, name, value)
-    run.status = status
-    session.flush()
-    audit.record(
-        session,
-        organization_id=run.organization_id,
-        action=AUDIT_ACTION_FAILED if status is SyncStatus.FAILED else AUDIT_ACTION_COMPLETED,
-        entity_type=AmazonSyncRun.__tablename__,
-        entity_id=run.id,
-        actor_type=ActorType.SYSTEM,
-        actor_label=AUDIT_ACTOR_LABEL,
-        after=audit.snapshot(run),
-        summary=(
-            f"Amazon orders sync {status.value.lower()}: "
-            f"{run.rows_seen} rows seen, {run.rows_created} created, "
-            f"{run.rows_updated} updated, {run.rows_unchanged} unchanged, "
-            f"{run.rows_failed} failed"
-        ),
-    )
-
-
-def _fail_run(
-    session: Session, run: AmazonSyncRun, failure: BaseException | None, *, completed_at: datetime
-) -> None:
-    """Close a run as FAILED after whatever went wrong, in a fresh transaction.
-
-    The session may be mid-failure; it is rolled back first so the final
-    update can commit. The exception itself is not re-raised here — the
-    caller is already propagating it.
-    """
-    session.rollback()
-    error_type = type(failure).__name__ if failure is not None else "Unknown"
-    error_message = str(failure) if failure is not None else "run ended without completing"
-    _logger.error(
-        "amazon.orders_sync.failed",
-        run_id=str(run.id),
-        error_type=error_type,
-        error_message=error_message,
-    )
-    try:
-        with transaction(session):
-            run = session.merge(run)
-            _close_run(
-                session,
-                run,
-                status=SyncStatus.FAILED,
-                completed_at=completed_at,
-                error_message=error_message[:1000],
-                error_details={"exception": error_type, "message": error_message},
-            )
-    except Exception:
-        # Nothing more can be done from here; the original failure is what
-        # the caller sees, and this one is in the log.
-        _logger.exception("amazon.orders_sync.fail_record_failed", run_id=str(run.id))

@@ -331,17 +331,28 @@ class AmazonClient:
 
     # -- inventory -----------------------------------------------------------
 
-    def iter_inventory_summaries(self, *, details: bool = True) -> Iterator[InventorySummary]:
+    def iter_inventory_summaries(
+        self, *, details: bool = True, page_delay_s: float = 0.0
+    ) -> Iterator[InventorySummary]:
         """Every FBA inventory summary for the marketplace, following ``nextToken``.
 
         ``details=True`` asks for the ``inventoryDetails`` block, which is
         where the inbound quantities live; without it every inbound field is
         ``None``.
+
+        ``page_delay_s`` is slept *between* pages (never before the first or
+        after the last). The retry policy only reacts to throttling after it
+        happens; a small pause keeps a large account under the endpoint's
+        ~2 requests/second in the first place.
         """
+        if page_delay_s < 0:
+            raise ValueError("page_delay_s must not be negative")
         next_token: str | None = None
         page = 0
         while True:
             page += 1
+            if page > 1 and page_delay_s:
+                self._sleep(page_delay_s)
             params: dict[str, Any] = {
                 "details": details,
                 "marketplaceIds": [self._config.marketplace.marketplace_id],

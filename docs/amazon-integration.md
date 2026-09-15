@@ -1,9 +1,9 @@
 # Amazon SP-API Integration
 
-Status: **Read-only client, tables, and the orders ingestion built.** No
-scheduler, endpoint or CLI exist yet; inventory and listings ingestion are
-not written. Everything has been exercised only against fakes — nothing has
-run against the real seller account (blocking question **B8**).
+Status: **Read-only client, tables, orders ingestion and inventory ingestion
+built.** No scheduler, endpoint or CLI exist yet; the listings→product
+mapping is not written. Everything has been exercised only against fakes —
+nothing has run against the real seller account (blocking question **B8**).
 Last updated: 2026-09-15
 
 ---
@@ -95,7 +95,7 @@ way to reach any other library endpoint through this object.
 | `get_report_status(report_id)` | `ReportStatus` | Where the report is in Amazon's queue. |
 | `download_report_document(report_document_id)` | `bytes` | The finished document. The library downloads it, gunzips it if Amazon compressed it, and decodes it using the charset Amazon declared; that text is returned as **UTF-8 bytes** so callers see one encoding. |
 | `fetch_report(report_type, data_start, data_end, report_options=None, *, poll_interval_s=15, timeout_s=1800)` | `bytes` | Request → poll until terminal → download. Raises `AmazonReportFailed` on `CANCELLED`, `FATAL`, `DONE` without a document, or timeout. |
-| `iter_inventory_summaries(*, details=True)` | `Iterator[InventorySummary]` | Every FBA inventory summary for the marketplace, following `nextToken` until exhausted. `details=True` requests the `inventoryDetails` block, which is where the inbound quantities live. |
+| `iter_inventory_summaries(*, details=True, page_delay_s=0.0)` | `Iterator[InventorySummary]` | Every FBA inventory summary for the marketplace, following `nextToken` until exhausted. `details=True` requests the `inventoryDetails` block, which is where the inbound quantities live. `page_delay_s` is slept *between* pages — the retry policy reacts to throttling; the delay avoids it. |
 
 Report types are passed as strings (the library's `ReportType` enum values,
 e.g. `GET_MERCHANT_LISTINGS_ALL_DATA`,
@@ -263,7 +263,59 @@ duplicate code.
 
 ---
 
-## 8. What is still unproven
+## 8. Inventory ingestion
+
+`app/services/amazon_inventory.py` — `run_inventory_sync(session,
+organization_id, trigger_type, triggered_by_user_id=None, client=None,
+listings_sink=None)` — has the same run/transaction/audit shape as the
+orders sync (the shared pieces now live in `app/services/amazon_runs.py`:
+`open_run`, `close_run`, `fail_run`). Job type `FBA_INVENTORY`; audit
+actions `amazon.inventory_sync.completed` / `.failed`.
+
+### Two reads, one snapshot per SKU
+
+1. **FBA Inventory** — `iter_inventory_summaries(details=True,
+   page_delay_s=AMAZON_INVENTORY_PAGE_DELAY_S)`. The default delay of 0.6 s
+   between pages keeps a 450-SKU account (≈ 9 pages of 50) under the
+   endpoint's ~2 requests/second without waiting for a 429 to say so.
+2. **The merchant listings report** — `GET_MERCHANT_LISTINGS_ALL_DATA` via
+   `fetch_report`. FBA Inventory knows nothing about merchant-fulfilled
+   stock; this report's `fulfillment-channel` column does. Eight columns are
+   read: `seller-sku`, `quantity`, `fulfillment-channel`, `asin1`,
+   `product-id`, `product-id-type`, `item-name`, `status`. Rows whose
+   channel is `DEFAULT` are FBM and their `quantity` is the FBM quantity; a
+   blank quantity stays `None`; an unknown channel value is kept verbatim
+   and **not** treated as FBM. `product-id-type` is mapped 1 → ASIN,
+   2 → ISBN, 3 → UPC, 4 → EAN for the listings mapping that follows.
+
+The two are merged per seller SKU into one `AmazonInventorySnapshot` with
+`captured_at` = the run's start time:
+
+- every FBA summary produces a row; an omitted quantity becomes `0`
+  explicitly, and `raw` keeps the API's own values (`None` preserved) so a
+  coerced zero is traceable;
+- an FBM listing for a SKU FBA returned sets `fbm_quantity` on that row;
+- an FBM listing for a SKU FBA did **not** return produces an FBM-only row
+  — zero FBA quantities, the FBM quantity, `raw.source = "listings_report"`;
+- an FBM-only listing with no `asin1` cannot satisfy the table's `NOT NULL`
+  ASIN and is counted as a failed row with a reason rather than invented.
+
+**Snapshots are append-only.** Every run inserts its own rows and never
+touches an earlier run's; `uq_amazon_inventory_snapshots_run_sku` makes a
+duplicate within a run impossible, and a duplicate FBA summary is counted as
+failed rather than allowed to trip it. Counts: `rows_seen` = summaries +
+listings rows, `rows_created` = snapshots written, `rows_failed` = listings
+rows rejected + merge failures, `error_details.fbm_only` = how many SKUs
+came only from the report.
+
+The parsed listings rows are handed, in memory, to `listings_sink` when one
+is given — that is the hook for the listings→product mapping, so it needs
+no second report fetch. A named `TODO(prompt-11)` in the service marks
+where the direct call replaces the hook.
+
+---
+
+## 9. What is still unproven
 
 The client has run only against fakes. Until B8 is answered and the probe
 step runs it against the real account, these remain assumptions:
@@ -279,7 +331,12 @@ step runs it against the real account, these remain assumptions:
   library decodes with a fallback of ISO-8859-1 if none is declared);
 - the exact column set and timestamp format of the live orders report — the
   parser's fixture follows Amazon's documentation, and the required twelve
-  columns are checked on every run, but the report has not been pulled.
+  columns are checked on every run, but the report has not been pulled;
+- the same for the merchant listings report, and whether its
+  `fulfillment-channel` values on this account are exactly `DEFAULT` and
+  `AMAZON_NA`;
+- the real page count and latency of FBA Inventory for this account, which
+  is what `AMAZON_INVENTORY_PAGE_DELAY_S` should be tuned against.
 
 Each is recorded when observed, in the same way
 [nineyard-field-mapping.md](nineyard-field-mapping.md) records Nineyard

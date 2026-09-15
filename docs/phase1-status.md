@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-15 (Amazon orders ingestion — POC step 4)
+Last updated: 2026-09-15 (Amazon inventory ingestion — POC step 5)
 
 ---
 
@@ -11,10 +11,10 @@ Last updated: 2026-09-15 (Amazon orders ingestion — POC step 4)
 |---|---|
 | Milestone | 1 — Data foundation, ingestion, matching |
 | Stage | **Phase 1 complete; phase 3 diagnostic built.** Schema, audit service, configuration/security foundation, and a read-only Nineyard probe exist. Backend is deployed to Railway. |
-| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012), Amazon SP-API configuration, read-only SP-API client, and the orders ingestion service (`run_orders_sync`). No vendor/import/matching logic. |
+| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012), Amazon SP-API configuration, read-only SP-API client, and the orders and inventory ingestion services (`run_orders_sync`, `run_inventory_sync`). No vendor/import/matching logic. |
 | Database schema | 24 tables, 22 enum types, 127 indexes, 74 check constraints, 80 foreign keys, 1 append-only trigger |
 | Migrations | 2 revisions (`506fd0ecc33a`, `3767ee979011`), applied and reversed against PostgreSQL 16.15 |
-| Backend tests | **573 passed** (`pytest`: 406 unit + 167 integration). `git grep -c "def test_"` finds 417 functions (257 unit, 160 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
+| Backend tests | **620 passed** (`pytest`: 442 unit + 178 integration). `git grep -c "def test_"` finds 455 functions (284 unit, 171 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
 | Quality gates | 8 of 8 passing locally **and in GitHub Actions** (§4), 2026-09-14 |
 | Docker stack | **Verified in CI** — full `docker compose up --build` from `.env.example`, API healthy against PostgreSQL, migration applied and checked, web answering (§4, §6 S1). Backend also live on Railway (§6 S2). |
 | Blocking questions open | 8 (see §7); B1 partially answered, B2 narrowed, B7 partially answered by ADR 0011, B8 new |
@@ -34,7 +34,7 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 | — | Planning and documentation | ✅ Complete | Scope, architecture, criteria, 10 ADRs |
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates, GitHub Actions CI (2026-09-14) |
 | 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
-| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | 🟨 Orders ingestion built | Precedes phase 2 by client request (§10). **Exists:** typed settings, redaction rules, the read-only client, the three tables, and `run_orders_sync` — report fetch, PII-free parse, idempotent upsert, audited run record ([amazon-integration.md §7](amazon-integration.md)). **Does not exist:** inventory and listings ingestion, scheduler, velocity endpoint, CLI. Nothing has run against the real account (B8). |
+| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | 🟨 Orders and inventory ingestion built | Precedes phase 2 by client request (§10). **Exists:** typed settings, redaction rules, the read-only client, the three tables, `run_orders_sync` ([amazon-integration.md §7](amazon-integration.md)) and `run_inventory_sync` — FBA on-hand and inbound plus FBM quantity from the listings report, append-only snapshots ([§8](amazon-integration.md)). **Does not exist:** listings→product mapping, scheduler, velocity endpoint, CLI. Nothing has run against the real account (B8). |
 | 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
 | 3 | Nineyard integration + sync | 🟨 Diagnostic only | **Exists:** read-only client (`app/integrations/nineyard/client.py`, `errors.py`, `sanitize.py`), probe (`app/integrations/nineyard/probe.py`), and CLI (`app/cli/nineyard_probe.py`), tested by `tests/unit/test_nineyard_client.py`, `test_nineyard_probe.py`, `test_nineyard_cli.py` (mocked; no live calls). The public OpenAPI spec has been analysed ([nineyard-field-mapping.md](nineyard-field-mapping.md)). **Does not exist:** any sync service — nothing writes Nineyard data to `products`, `product_identifiers`, `marketplace_listings`, `nineyard_sync_runs`, or `nineyard_item_payloads`. The probe has not been run against the live API. See [nineyard-integration.md](nineyard-integration.md) and B1. |
 | 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
@@ -150,6 +150,34 @@ vendor of the **same code** in each — which the per-organization unique index
 permits, and which is exactly the shape of a leak — and proves select, update
 and delete stay inside the caller's tenant, including a lookup by the other
 tenant's primary key. Assumption A19 is amended accordingly.
+
+### Amazon inventory ingestion (2026-09-15, POC step 5)
+
+`app/services/amazon_inventory.py` — `run_inventory_sync` reads every FBA
+inventory summary (with a configurable pause between pages,
+`AMAZON_INVENTORY_PAGE_DELAY_S`, default 0.6 s) and the merchant listings
+report in one run, merges them per seller SKU, and appends one
+`AmazonInventorySnapshot` per SKU with `captured_at` = the run start. FBM
+quantity comes from listings rows whose `fulfillment-channel` is `DEFAULT`;
+an FBM-only SKU gets a snapshot with zero FBA quantities. Snapshots are
+append-only — a second run adds rows and changes none. Full description in
+[amazon-integration.md §8](amazon-integration.md).
+
+The run bookkeeping shared with the orders sync — claim the `RUNNING`
+slot, close with counts and an audit event, close as `FAILED` on any
+exception — now lives once in `app/services/amazon_runs.py`; the orders
+service uses it with no change to its behaviour or tests.
+
+**33 parse/merge unit tests** (FBA row, FBM row, blank FBM quantity, unknown
+channel, product-id-type 1 vs 3, Latin-1 name, merge cases including
+FBM-only without ASIN and duplicate summaries) and **11 integration tests**
+(one snapshot per SKU with FBA and FBM merged, page delay reaching the
+client, append-only across two runs, the listings sink, rejected rows,
+failure while paging, failure fetching the report, failure inside the insert
+transaction, the concurrent-run guard, a running orders job not blocking
+inventory). The parsed listings rows are passed to an optional
+`listings_sink`; a named `TODO(prompt-11)` marks where the mapping service
+takes over.
 
 ### Amazon orders ingestion (2026-09-15, POC step 4)
 
@@ -325,10 +353,10 @@ file: https://github.com/cbfriedman/Power-BI-Data-Analysis-and-Inventory/actions
 
 | Gate | Command | Result |
 |---|---|---|
-| Backend format | `ruff format .` | ✅ 96 files unchanged |
+| Backend format | `ruff format .` | ✅ 100 files unchanged |
 | Backend lint | `ruff check .` | ✅ All checks passed |
-| Backend types | `mypy` (strict) | ✅ No issues in 93 source files |
-| Backend tests | `pytest` | ✅ `573 passed in 9.73s` — `tests/unit`: `406 passed`; `tests/integration`: `167 passed` |
+| Backend types | `mypy` (strict) | ✅ No issues in 97 source files |
+| Backend tests | `pytest` | ✅ `620 passed in 9.85s` — `tests/unit`: `442 passed`; `tests/integration`: `178 passed` |
 | Migration apply | `alembic upgrade head` | ✅ Both revisions applied to PostgreSQL 16.15 |
 | Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types; one-step downgrade of `3767ee979011` leaves the 21 shared types intact |
 | Migration drift | `alembic check` | ✅ No new upgrade operations detected |

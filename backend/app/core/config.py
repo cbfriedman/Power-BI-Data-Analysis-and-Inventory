@@ -130,6 +130,10 @@ class Settings(BaseSettings):
     # Applies to transient failures only, as with Nineyard. SP-API throttles
     # aggressively, so the ceiling is higher.
     amazon_max_attempts: int = 5
+    # Pause between FBA inventory pages. The endpoint allows ~2 requests per
+    # second; 0.6 s keeps a 450-SKU account (≈ 9 pages of 50) comfortably
+    # under it without waiting for a 429 to say so.
+    amazon_inventory_page_delay_s: float = 0.6
 
     @property
     def amazon_configured(self) -> bool:

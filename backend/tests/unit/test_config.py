@@ -120,6 +120,7 @@ class TestAmazonSettings:
         assert settings.amazon_region == "NA"
         assert settings.amazon_timeout_seconds == 60.0
         assert settings.amazon_max_attempts == 5
+        assert settings.amazon_inventory_page_delay_s == 0.6
 
     def test_configured_when_all_four_credentials_are_present(self) -> None:
         assert Settings(**self.FULL).amazon_configured is True
