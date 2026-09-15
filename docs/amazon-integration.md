@@ -1,9 +1,10 @@
 # Amazon SP-API Integration
 
-Status: **Read-only client, tables, orders ingestion, inventory ingestion
-and listings→product mapping built.** No scheduler, endpoint or CLI exist
-yet. Everything has been exercised only against fakes — nothing has run
-against the real seller account (blocking question **B8**).
+Status: **Complete against fakes.** Client, tables, the three ingestions,
+listings→product mapping, the scheduler and the `amazon_poc` CLI exist and
+are tested. Nothing has run against the real seller account (blocking
+question **B8**), and the read-only velocity HTTP endpoint from ADR 0011 is
+not yet built (the velocity *service* the CLI uses is).
 Last updated: 2026-09-15
 
 ---
@@ -389,7 +390,77 @@ rather than "close enough".
 
 ---
 
-## 10. What is still unproven
+## 10. Scheduling, run recovery, and the CLI
+
+### The scheduler boundary
+
+`app/jobs/runner.py` defines `JobRunner` — `schedule(job_id, func,
+interval_minutes | cron)`, `start()`, `shutdown()` — and one implementation,
+`APSchedulerRunner`: APScheduler 3.x, an in-process `BackgroundScheduler`,
+no broker, no job store. Every job is registered with `max_instances=1`
+(a slow run is never overlapped by the next tick), `coalesce=True` (missed
+ticks collapse into one run) and `misfire_grace_time=3600`. Tests drive the
+jobs through a fake runner and never start a thread.
+
+The scheduler starts in the FastAPI lifespan **only when `AMAZON_ENABLED` is
+true and never under `APP_ENV=test`**, and it is in-process: it belongs in
+exactly one process. Several API replicas means moving it to the worker.
+
+### The jobs
+
+`app/jobs/amazon.py` — three plain callables, each opening its own session
+through `session_scope()`, running as `SCHEDULED`, and catching everything so
+one failure never stops the scheduler (the run row already carries the
+detail):
+
+| Job | Default interval | What it does |
+|---|---|---|
+| `amazon.orders` | 24 h | `AMAZON_ORDERS_WINDOW_DAYS` (35) split into ≤30-day report requests, oldest first — `[now-35d, now-5d]` then `[now-5d, now]`. Overlap between runs is harmless: the upsert only ever moves a line forward. |
+| `amazon.inventory` | 60 min | FBA summaries + listings report → snapshots and mapping (§8, §9). |
+| `amazon.listings` | 24 h, registered after inventory | The listings report alone → mapping (`run_listings_sync`, job type `LISTINGS_REPORT`). Exists so catalog changes are re-evaluated daily without an inventory pull. |
+
+Before each job opens its run it **recovers stale runs**: any `RUNNING` row
+of its own job type whose `started_at` is older than
+`AMAZON_RUN_TIMEOUT_MINUTES` (120) is closed as `FAILED` with
+`error_message = "timed out"`, audited as `amazon.run.timed_out`. A process
+that died between claiming the slot and its `finally` would otherwise block
+that job type forever.
+
+Credentials are one set per deployment, so the jobs need to know which
+tenant to write into: `AMAZON_ORGANIZATION_SLUG` names it, and may be
+omitted while exactly one active organization exists.
+
+### The CLI
+
+`python -m app.cli.amazon_poc` — same shape as `nineyard_probe`: argparse,
+`configure_logging`, fixed exit codes (`0` ok, `1` a run `FAILED`, `2`
+configuration or credentials, `3` unexpected).
+
+| Subcommand | Does |
+|---|---|
+| `auth` | LWA exchange through `AmazonClient.check_credentials()`; prints the token's expiry and **nothing else** — the token is reduced to a hash prefix before it leaves the client. |
+| `sync-orders [--days N]` | The orders job's windows, as `MANUAL` runs. |
+| `sync-inventory` / `sync-listings` | One run each. |
+| `run` | Orders, inventory, listings, in order; stops at the first failure. |
+| `velocity [--level sku\|product] [--top N]` | The aligned table from `app/services/amazon_velocity.py`. |
+
+Each sync command recovers stale runs first, prints one line per run with
+status and counts, and exits `1` if any run ended `FAILED`.
+
+### Velocity
+
+`app/services/amazon_velocity.py` combines, per seller SKU: units ordered in
+the trailing 7 / 14 / 30 days from `amazon_order_lines` (cancelled lines
+excluded), the latest `amazon_inventory_snapshots` row (fulfillable, FBM,
+inbound = working + shipped + receiving), and the listing's mapping with the
+product's Catalog Item Number and UPC. Days of supply is `(fulfillable +
+FBM) / (units_14 / 14)`, and is blank rather than infinite when nothing
+sold. `--level product` merges a product's SKUs into one row. No
+replenishment quantity is computed anywhere (ADR 0011).
+
+---
+
+## 11. What is still unproven
 
 The client has run only against fakes. Until B8 is answered and the probe
 step runs it against the real account, these remain assumptions:
@@ -410,7 +481,10 @@ step runs it against the real account, these remain assumptions:
   `fulfillment-channel` values on this account are exactly `DEFAULT` and
   `AMAZON_NA`;
 - the real page count and latency of FBA Inventory for this account, which
-  is what `AMAZON_INVENTORY_PAGE_DELAY_S` should be tuned against.
+  is what `AMAZON_INVENTORY_PAGE_DELAY_S` should be tuned against;
+- how long a 30-day orders report takes to generate for this seller, which
+  sets whether the 24-hour orders interval and the 2-hour run timeout are
+  right.
 
 Each is recorded when observed, in the same way
 [nineyard-field-mapping.md](nineyard-field-mapping.md) records Nineyard

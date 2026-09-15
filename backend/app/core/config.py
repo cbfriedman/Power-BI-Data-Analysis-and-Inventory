@@ -135,6 +135,19 @@ class Settings(BaseSettings):
     # under it without waiting for a 429 to say so.
     amazon_inventory_page_delay_s: float = 0.6
 
+    # Scheduling (app/jobs/amazon.py). Intervals in minutes; the orders window
+    # in days is split into report-sized (30-day) chunks by the job. A RUNNING
+    # run older than the timeout is assumed dead and closed as FAILED before
+    # a new one starts.
+    amazon_orders_interval_minutes: int = 1440
+    amazon_inventory_interval_minutes: int = 60
+    amazon_listings_interval_minutes: int = 1440
+    amazon_orders_window_days: int = 35
+    amazon_run_timeout_minutes: int = 120
+    # Which organization the configured Amazon account belongs to. Optional
+    # while exactly one organization exists; required after that.
+    amazon_organization_slug: str | None = None
+
     @property
     def amazon_configured(self) -> bool:
         """True only when every credential the LWA exchange needs is present."""

@@ -47,10 +47,13 @@ from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 from sqlalchemy.orm import Session
 
 from app.core.logging import get_logger
+from app.db.transaction import transaction
 from app.matching.normalize import normalize_gtin
+from app.models.amazon import AmazonSyncRun
 from app.models.catalog import MarketplaceListing, ProductIdentifier
 from app.models.enums import (
     ActorType,
+    AmazonSyncJobType,
     ExceptionReason,
     ExceptionStatus,
     IdentifierType,
@@ -58,14 +61,18 @@ from app.models.enums import (
     MappingStatus,
     Marketplace,
     MatchMethod,
+    SyncStatus,
+    TriggerType,
 )
 from app.models.matching import ProductMappingException
 from app.repositories.scoping import ScopedRepository, TenantScope
 from app.services import audit
+from app.services.amazon_runs import SyncAlreadyRunning
 from app.services.system_user import ensure_system_user
 
 if TYPE_CHECKING:
     from app.services.amazon_inventory import ParsedListing
+    from app.services.amazon_orders import ReportFetcher
 
 _logger = get_logger(__name__)
 
@@ -580,3 +587,104 @@ def _pending_exception(
             ProductMappingException.status == ExceptionStatus.PENDING,
         )
     ).scalar_one_or_none()
+
+
+# --- a standalone run: fetch the listings report and map it -------------------------------
+
+
+AUDIT_ACTION_COMPLETED: Final = "amazon.listings_sync.completed"
+AUDIT_ACTION_FAILED: Final = "amazon.listings_sync.failed"
+AUDIT_ACTOR_LABEL_SYNC: Final = "amazon-listings-sync"
+
+
+class ListingsSyncAlreadyRunning(SyncAlreadyRunning):
+    """Another LISTINGS_REPORT run is still RUNNING for this organization."""
+
+
+def run_listings_sync(
+    session: Session,
+    organization_id: uuid.UUID,
+    trigger_type: TriggerType,
+    triggered_by_user_id: uuid.UUID | None = None,
+    client: ReportFetcher | None = None,
+    *,
+    marketplace_id: str | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+) -> AmazonSyncRun:
+    """Fetch the merchant listings report and map it, as its own run.
+
+    The inventory sync maps listings too, because it already has the report
+    in hand. This run exists for the daily re-evaluation that picks up
+    catalog changes (new ``AMAZON_SKU`` identifiers, say) without waiting
+    for an inventory pull, and for the CLI. Same run/transaction/audit shape
+    as the other two jobs.
+    """
+    from app.core.config import get_settings
+    from app.integrations.amazon import AmazonClient, AmazonConfig
+    from app.services.amazon_inventory import LISTINGS_REPORT_TYPE, parse_listings_report
+    from app.services.amazon_runs import close_run, fail_run, open_run
+
+    started_at = now()
+    settings = get_settings()
+    if client is None:
+        client = AmazonClient(AmazonConfig.from_settings(settings))
+    marketplace_id = marketplace_id or settings.amazon_marketplace_id
+
+    try:
+        run = open_run(
+            session,
+            organization_id=organization_id,
+            job_type=AmazonSyncJobType.LISTINGS_REPORT,
+            trigger_type=trigger_type,
+            marketplace_id=marketplace_id,
+            started_at=started_at,
+            triggered_by_user_id=triggered_by_user_id,
+        )
+    except SyncAlreadyRunning as exc:
+        raise ListingsSyncAlreadyRunning(str(exc)) from exc
+
+    failure: BaseException | None = None
+    try:
+        content = client.fetch_report(LISTINGS_REPORT_TYPE, started_at, started_at)
+        parsed = parse_listings_report(content)
+        with transaction(session):
+            summary = map_listings(
+                session,
+                organization_id,
+                parsed.listings,
+                marketplace_id=marketplace_id,
+                now=lambda: started_at,
+            )
+            close_run(
+                session,
+                run,
+                status=(
+                    SyncStatus.COMPLETED_WITH_ERRORS if parsed.rows_failed else SyncStatus.COMPLETED
+                ),
+                audit_action=AUDIT_ACTION_COMPLETED,
+                actor_label=AUDIT_ACTOR_LABEL_SYNC,
+                completed_at=now(),
+                rows_seen=parsed.rows_seen,
+                rows_created=summary.listings_created,
+                rows_updated=summary.listings_updated,
+                rows_unchanged=0,
+                rows_failed=parsed.rows_failed,
+                error_details={
+                    **({"rows": parsed.errors[:100]} if parsed.errors else {}),
+                    "listings_mapping": summary.as_json(),
+                },
+            )
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        if run.status is SyncStatus.RUNNING:
+            fail_run(
+                session,
+                run,
+                failure,
+                completed_at=now(),
+                audit_action=AUDIT_ACTION_FAILED,
+                actor_label=AUDIT_ACTOR_LABEL_SYNC,
+            )
+    return run

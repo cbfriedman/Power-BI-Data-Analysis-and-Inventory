@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-15 (Amazon listings → product mapping — POC step 6)
+Last updated: 2026-09-15 (Amazon scheduler and amazon_poc CLI — POC step 7)
 
 ---
 
@@ -11,10 +11,10 @@ Last updated: 2026-09-15 (Amazon listings → product mapping — POC step 6)
 |---|---|
 | Milestone | 1 — Data foundation, ingestion, matching |
 | Stage | **Phase 1 complete; phase 3 diagnostic built.** Schema, audit service, configuration/security foundation, and a read-only Nineyard probe exist. Backend is deployed to Railway. |
-| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012), Amazon SP-API configuration, read-only SP-API client, the orders and inventory ingestion services, the listings→product mapping (`map_listings`) and the shared identifier normaliser (`app/matching/normalize.py`). No vendor CRUD or file import yet. |
+| Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012), Amazon SP-API configuration, read-only SP-API client, the three ingestion services, the listings→product mapping, the shared identifier normaliser, the sales-velocity service, an APScheduler runner behind a `JobRunner` protocol, and the `amazon_poc` CLI. No vendor CRUD or file import yet. |
 | Database schema | 24 tables, 22 enum types, 130 indexes, 78 check constraints, 81 foreign keys, 1 append-only trigger |
 | Migrations | 3 revisions (`506fd0ecc33a`, `3767ee979011`, `3de5c4e5def0`), applied and reversed against PostgreSQL 16.15 |
-| Backend tests | **695 passed** (`pytest`: 496 unit + 199 integration). `git grep -c "def test_"` finds 513 functions (321 unit, 192 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
+| Backend tests | **740 passed** (`pytest`: 532 unit + 208 integration). `git grep -c "def test_"` finds 557 functions (356 unit, 201 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
 | Quality gates | 8 of 8 passing locally **and in GitHub Actions** (§4), 2026-09-14 |
 | Docker stack | **Verified in CI** — full `docker compose up --build` from `.env.example`, API healthy against PostgreSQL, migration applied and checked, web answering (§4, §6 S1). Backend also live on Railway (§6 S2). |
 | Blocking questions open | 8 (see §7); B1 partially answered, B2 narrowed, B7 partially answered by ADR 0011, B8 new |
@@ -34,7 +34,7 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 | — | Planning and documentation | ✅ Complete | Scope, architecture, criteria, 10 ADRs |
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates, GitHub Actions CI (2026-09-14) |
 | 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
-| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | 🟨 Ingestion and mapping built | Precedes phase 2 by client request (§10). **Exists:** typed settings, redaction rules, the read-only client, the three tables, `run_orders_sync` ([§7](amazon-integration.md)), `run_inventory_sync` ([§8](amazon-integration.md)) and `map_listings` — seller SKU → product through the §5.1 priority chain only ([§9](amazon-integration.md)). **Does not exist:** scheduler, velocity endpoint, CLI. Nothing has run against the real account (B8). |
+| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | 🟨 Complete against fakes | Precedes phase 2 by client request (§10). **Exists:** settings, redaction, the read-only client, the tables, the three ingestions, listings→product mapping, the velocity service, scheduled jobs with stale-run recovery, and the `amazon_poc` CLI ([amazon-integration.md](amazon-integration.md)). **Does not exist:** the read-only velocity HTTP endpoint named in the ADR. **Not yet done:** a single run against the real seller account (B8) — the one thing the client asked to see. |
 | 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
 | 3 | Nineyard integration + sync | 🟨 Diagnostic only | **Exists:** read-only client (`app/integrations/nineyard/client.py`, `errors.py`, `sanitize.py`), probe (`app/integrations/nineyard/probe.py`), and CLI (`app/cli/nineyard_probe.py`), tested by `tests/unit/test_nineyard_client.py`, `test_nineyard_probe.py`, `test_nineyard_cli.py` (mocked; no live calls). The public OpenAPI spec has been analysed ([nineyard-field-mapping.md](nineyard-field-mapping.md)). **Does not exist:** any sync service — nothing writes Nineyard data to `products`, `product_identifiers`, `marketplace_listings`, `nineyard_sync_runs`, or `nineyard_item_payloads`. The probe has not been run against the live API. See [nineyard-integration.md](nineyard-integration.md) and B1. |
 | 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
@@ -150,6 +150,43 @@ vendor of the **same code** in each — which the per-organization unique index
 permits, and which is exactly the shape of a leak — and proves select, update
 and delete stay inside the caller's tenant, including a lookup by the other
 tenant's primary key. Assumption A19 is amended accordingly.
+
+### Amazon scheduler, run recovery and CLI (2026-09-15, POC step 7)
+
+* **`app/jobs/runner.py`** — `JobRunner` protocol (`schedule` /
+  `start` / `shutdown`) and `APSchedulerRunner`: APScheduler 3.x
+  in-process, `max_instances=1`, `coalesce=True`,
+  `misfire_grace_time=3600`, no broker, no job store. Replaceable in one
+  module; tests use a fake runner and never start a thread.
+* **`app/jobs/amazon.py`** — orders (24 h; `AMAZON_ORDERS_WINDOW_DAYS`=35
+  split into ≤30-day report requests, which is how the brief's 35-day
+  window and the report's 30-day cap coexist), inventory (60 min), listings
+  (24 h, after inventory). Each opens its own session, runs `SCHEDULED`,
+  catches everything. **Stale-run recovery** closes any `RUNNING` run of the
+  job type older than `AMAZON_RUN_TIMEOUT_MINUTES` as `FAILED` ("timed out")
+  with an audit event, before the new run claims the slot — integration
+  tested, including that recovery frees the slot and never touches another
+  job type or tenant. The scheduler starts in the lifespan only with
+  `AMAZON_ENABLED=true` and never under `APP_ENV=test` (tested).
+* **`app/cli/amazon_poc.py`** — `auth` (prints the token's expiry, nothing
+  else), `sync-orders [--days]`, `sync-inventory`, `sync-listings`, `run`,
+  `velocity [--level sku|product] [--top N]`; exit `1` on any `FAILED` run,
+  `2` on configuration, `3` unexpected. README has a "Running the Amazon
+  POC" section.
+* **`app/services/amazon_velocity.py`** — the CLI needed a velocity
+  computation that did not exist (the prompt sequence skipped from 11 to
+  13): units 7/14/30 from order lines excluding cancellations, the latest
+  snapshot per SKU, mapping + Catalog Item Number + UPC, days of supply
+  blank when nothing sold. The HTTP endpoint from the ADR is still owed.
+* Also: `AmazonClient.check_credentials()` (an LWA exchange that returns
+  only expiry and a hash prefix), `run_listings_sync` for the standalone
+  listings job, `resolve_amazon_organization` (`AMAZON_ORGANIZATION_SLUG`,
+  optional while one organization exists).
+* **Tests:** 17 CLI (parsing, table alignment, exit-code mapping with
+  dispatch stubbed), 16 runner/jobs (protocol with a fake runner, APScheduler
+  options without starting, window splitting, lifespan guards), 9
+  integration (stale-run recovery ×4, organization resolution, the listings
+  run, velocity ×2).
 
 ### Amazon listings → product mapping (2026-09-15, POC step 6)
 
@@ -387,10 +424,10 @@ file: https://github.com/cbfriedman/Power-BI-Data-Analysis-and-Inventory/actions
 
 | Gate | Command | Result |
 |---|---|---|
-| Backend format | `ruff format .` | ✅ 108 files unchanged |
+| Backend format | `ruff format .` | ✅ 116 files unchanged |
 | Backend lint | `ruff check .` | ✅ All checks passed |
-| Backend types | `mypy` (strict) | ✅ No issues in 104 source files |
-| Backend tests | `pytest` | ✅ `695 passed in 12.75s` — `tests/unit`: `496 passed`; `tests/integration`: `199 passed` |
+| Backend types | `mypy` (strict) | ✅ No issues in 112 source files |
+| Backend tests | `pytest` | ✅ `740 passed in 10.28s` — `tests/unit`: `532 passed`; `tests/integration`: `208 passed` |
 | Migration apply | `alembic upgrade head` | ✅ Both revisions applied to PostgreSQL 16.15 |
 | Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types; one-step downgrades of `3767ee979011` and `3de5c4e5def0` each re-apply cleanly |
 | Migration drift | `alembic check` | ✅ No new upgrade operations detected |

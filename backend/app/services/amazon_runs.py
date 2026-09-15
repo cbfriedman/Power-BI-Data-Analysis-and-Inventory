@@ -11,9 +11,10 @@ around them because the work in between is theirs.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timedelta
+from typing import Any, Final
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -22,9 +23,109 @@ from app.core.logging import get_logger
 from app.db.transaction import transaction
 from app.models.amazon import AmazonSyncRun
 from app.models.enums import ActorType, AmazonSyncJobType, SyncStatus, TriggerType
+from app.models.organization import Organization
+from app.repositories.scoping import TenantScope
 from app.services import audit
 
 _logger = get_logger(__name__)
+
+STALE_RUN_MESSAGE: Final = "timed out"
+AUDIT_ACTION_STALE: Final = "amazon.run.timed_out"
+AUDIT_ACTOR_LABEL_STALE: Final = "amazon-run-recovery"
+
+
+class AmazonOrganizationError(Exception):
+    """The organization the Amazon account belongs to could not be determined."""
+
+
+def resolve_amazon_organization(session: Session, slug: str | None) -> uuid.UUID:
+    """The organization the configured Amazon credentials belong to.
+
+    Credentials are per deployment (one ``AMAZON_*`` set), so the jobs need
+    to know which tenant to write into. ``AMAZON_ORGANIZATION_SLUG`` names
+    it; while exactly one active organization exists it may be omitted.
+    """
+    if slug:
+        found = session.execute(
+            select(Organization.id).where(Organization.slug == slug, Organization.is_active)
+        ).scalar_one_or_none()
+        if found is None:
+            raise AmazonOrganizationError(
+                f"AMAZON_ORGANIZATION_SLUG {slug!r} does not name an active organization"
+            )
+        return found
+
+    ids = list(session.execute(select(Organization.id).where(Organization.is_active)).scalars())
+    if len(ids) == 1:
+        return ids[0]
+    if not ids:
+        raise AmazonOrganizationError("no active organization exists yet")
+    raise AmazonOrganizationError(
+        f"{len(ids)} active organizations exist; set AMAZON_ORGANIZATION_SLUG to choose one"
+    )
+
+
+def recover_stale_runs(
+    session: Session,
+    organization_id: uuid.UUID,
+    job_type: AmazonSyncJobType,
+    *,
+    now: datetime,
+    timeout: timedelta,
+) -> list[uuid.UUID]:
+    """Close RUNNING runs older than ``timeout`` as FAILED ("timed out").
+
+    A process that died between claiming the slot and its ``finally`` leaves
+    a RUNNING row that would block every later run of the same job type
+    forever. Anything RUNNING for longer than the timeout is assumed dead.
+    Commits in its own transaction; returns the ids it closed.
+    """
+    cutoff = now - timeout
+    stale = list(
+        session.execute(
+            TenantScope(organization_id)
+            .select(AmazonSyncRun)
+            .where(
+                AmazonSyncRun.job_type == job_type,
+                AmazonSyncRun.status == SyncStatus.RUNNING,
+                AmazonSyncRun.started_at.is_not(None),
+                AmazonSyncRun.started_at < cutoff,
+            )
+        ).scalars()
+    )
+    if not stale:
+        return []
+
+    with transaction(session):
+        for run in stale:
+            before = audit.snapshot(run)
+            run.status = SyncStatus.FAILED
+            run.completed_at = now
+            run.error_message = STALE_RUN_MESSAGE
+            run.error_details = {
+                "exception": "StaleRun",
+                "message": STALE_RUN_MESSAGE,
+                "started_at": run.started_at.isoformat() if run.started_at else None,
+                "timeout_minutes": int(timeout.total_seconds() // 60),
+            }
+            session.flush()
+            audit.record_change(
+                session,
+                organization_id=organization_id,
+                action=AUDIT_ACTION_STALE,
+                instance=run,
+                before=before,
+                actor_type=ActorType.SYSTEM,
+                actor_label=AUDIT_ACTOR_LABEL_STALE,
+                summary=f"{job_type.value} run {run.id} marked FAILED: {STALE_RUN_MESSAGE}",
+            )
+            _logger.warning(
+                "amazon.run.timed_out",
+                run_id=str(run.id),
+                job_type=job_type.value,
+                started_at=run.started_at.isoformat() if run.started_at else None,
+            )
+    return [run.id for run in stale]
 
 
 class SyncAlreadyRunning(Exception):  # noqa: N818 — a state, not a fault

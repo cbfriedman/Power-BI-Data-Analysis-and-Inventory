@@ -30,6 +30,7 @@ construct while that variable is set, so the marketplace can only come from
 
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import time
@@ -92,6 +93,14 @@ REGION_TO_AWS: Final[Mapping[str, str]] = {
 
 #: The environment variable the library would let override our marketplace.
 LIBRARY_MARKETPLACE_OVERRIDE: Final = "SP_API_DEFAULT_MARKETPLACE"
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialCheck:
+    """The outcome of a Login with Amazon exchange, minus the token."""
+
+    expires_in_seconds: int | None
+    token_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +213,27 @@ class AmazonClient:
             marketplace=self._config.marketplace,
             credentials=self._credentials(),
             timeout=self._config.timeout_seconds,
+        )
+
+    # -- credentials ----------------------------------------------------------
+
+    def check_credentials(self) -> CredentialCheck:
+        """Exchange the refresh token for an access token and report its lifetime.
+
+        The token itself never leaves this method: what comes back is how long
+        the token is valid for and a short hash prefix that distinguishes two
+        exchanges in a log without being usable as a credential.
+        """
+        response = self._call_response(
+            "LWA token exchange", lambda: self._api(self._reports_class).auth
+        )
+        expires_in = getattr(response, "expires_in", None)
+        token = getattr(response, "access_token", None)
+        if not isinstance(token, str) or not token:
+            raise AmazonAuthError("LWA token exchange returned no access token")
+        return CredentialCheck(
+            expires_in_seconds=int(expires_in) if isinstance(expires_in, int | float) else None,
+            token_fingerprint=hashlib.sha256(token.encode()).hexdigest()[:12],
         )
 
     # -- reports -------------------------------------------------------------

@@ -10,6 +10,7 @@ from app.integrations.amazon.client import (
     RETRYABLE_EXCEPTIONS,
     AmazonClient,
     AmazonConfig,
+    CredentialCheck,
     resolve_marketplace,
 )
 from app.integrations.amazon.dtos import InventorySummary, ReportRequest, ReportStatus
@@ -32,6 +33,7 @@ __all__ = [
     "AmazonRateLimited",
     "AmazonReportFailed",
     "AmazonTransientError",
+    "CredentialCheck",
     "InventorySummary",
     "ReportRequest",
     "ReportStatus",

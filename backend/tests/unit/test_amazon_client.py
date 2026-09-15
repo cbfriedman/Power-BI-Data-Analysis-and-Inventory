@@ -108,6 +108,11 @@ def make_fakes(recorder: Recorder) -> tuple[type, type]:
             recorder.calls.append(("get_report_document", (document_id,), kwargs))
             return recorder.next()
 
+        @property
+        def auth(self) -> Any:
+            recorder.calls.append(("auth", (), {}))
+            return recorder.next()
+
     class FakeInventories:
         def __init__(self, **kwargs: Any) -> None:
             recorder.constructions.append(kwargs)
@@ -279,8 +284,9 @@ class TestReadOnlyStructure:
 
         assert offenders == set(), f"write-shaped methods on AmazonClient: {sorted(offenders)}"
 
-    def test_the_public_surface_is_exactly_the_five_reads(self) -> None:
+    def test_the_public_surface_is_exactly_the_reads(self) -> None:
         assert self.public_methods() == {
+            "check_credentials",
             "request_report",
             "get_report_status",
             "download_report_document",
@@ -403,6 +409,29 @@ class TestCredentialBoundary:
         # The lines themselves still arrived — it is the values that are gone.
         assert "amazon.report.requested" in out
         assert "amazon.retrying" in out
+
+
+class TestCheckCredentials:
+    def test_reports_expiry_and_a_fingerprint_but_never_the_token(
+        self, client: AmazonClient, recorder: Recorder
+    ) -> None:
+        token = "Atza|IwEBIExampleAccessToken_abcdefghijklmnopqrstuvwxyz0123456789"
+        recorder.script = [lambda: type("Resp", (), {"access_token": token, "expires_in": 3600})()]
+
+        check = client.check_credentials()
+
+        assert check.expires_in_seconds == 3600
+        assert len(check.token_fingerprint) == 12
+        assert token not in repr(check)
+        assert recorder.calls == [("auth", (), {})]
+
+    def test_an_lwa_failure_is_an_auth_error(
+        self, client: AmazonClient, recorder: Recorder
+    ) -> None:
+        recorder.script = [raises(AuthorizationError("invalid_client", "bad secret", 401))]
+
+        with pytest.raises(AmazonAuthError, match="invalid_client"):
+            client.check_credentials()
 
 
 # --- DTO mapping ---------------------------------------------------------------

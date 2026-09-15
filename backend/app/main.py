@@ -18,13 +18,17 @@ from app.core.middleware import RequestContextMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Log startup and shutdown. No database connection is opened here.
+    """Log startup and shutdown, and run the Amazon scheduler when enabled.
 
-    Connecting at startup would make the API refuse to boot whenever PostgreSQL
-    is briefly unavailable, when reporting the problem through the readiness
-    probe is far more useful.
+    No database connection is opened here: connecting at startup would make
+    the API refuse to boot whenever PostgreSQL is briefly unavailable, when
+    reporting the problem through the readiness probe is far more useful.
+
+    The scheduler starts only when ``AMAZON_ENABLED`` is true and never under
+    ``APP_ENV=test``. It is in-process, so it belongs in exactly one process;
+    a deployment with several API replicas moves it to the worker.
     """
-    settings = get_settings()
+    settings: Settings = app.state.settings
     logger = get_logger(__name__)
     logger.info(
         "app.startup",
@@ -32,8 +36,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         environment=settings.app_env,
         api_prefix=settings.api_v1_prefix,
     )
-    yield
-    logger.info("app.shutdown", app_name=settings.app_name)
+    runner = None
+    if settings.amazon_enabled and settings.app_env.strip().lower() != "test":
+        from app.jobs.amazon import build_amazon_runner
+
+        runner = build_amazon_runner(settings)
+        runner.start()
+        app.state.job_runner = runner
+        logger.info("app.scheduler_started")
+    try:
+        yield
+    finally:
+        if runner is not None:
+            runner.shutdown()
+            logger.info("app.scheduler_stopped")
+        logger.info("app.shutdown", app_name=settings.app_name)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

@@ -180,6 +180,7 @@ Copy [.env.example](.env.example) to `.env` and edit. `.env` is git-ignored;
 
 | Variable | Purpose |
 |---|---|
+| `AMAZON_*` | Read-only SP-API ingestion — see [Running the Amazon POC](#running-the-amazon-poc) and `.env.example` |
 | `DATABASE_URL` | SQLAlchemy connection URL |
 | `APP_ENV` | Environment name reported by the readiness probe |
 | `LOG_LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
@@ -189,6 +190,64 @@ Copy [.env.example](.env.example) to `.env` and edit. `.env` is git-ignored;
 | `STORAGE_*_DIR` | Retained import file locations (ADR 0004) |
 
 ---
+
+## Running the Amazon POC
+
+The Amazon SP-API proof of concept ([ADR 0011](docs/decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md),
+[docs/amazon-integration.md](docs/amazon-integration.md)) is read-only: it
+pulls orders, FBA/FBM inventory and listings into PostgreSQL, maps seller
+SKUs to catalog products through the matching chain, and reports sales
+velocity. It never writes to Amazon and never stores buyer data.
+
+1. Put the Login with Amazon credentials in `.env` — `AMAZON_LWA_CLIENT_ID`,
+   `AMAZON_LWA_CLIENT_SECRET`, `AMAZON_LWA_REFRESH_TOKEN`, `AMAZON_SELLER_ID`
+   (Seller Central > Apps & Services > Develop Apps, self-authorised app).
+   They are read from the environment only and are never printed or logged.
+2. Confirm the credentials work. This prints the access token's expiry and
+   nothing else:
+
+   ```powershell
+   cd backend
+   .\.venv\Scripts\python -m app.cli.amazon_poc auth
+   ```
+
+3. Run the ingestion once, in order — orders (trailing 35 days, in 30-day
+   report requests), inventory, listings:
+
+   ```powershell
+   .\.venv\Scripts\python -m app.cli.amazon_poc run
+   # or one at a time:
+   .\.venv\Scripts\python -m app.cli.amazon_poc sync-orders --days 35
+   .\.venv\Scripts\python -m app.cli.amazon_poc sync-inventory
+   .\.venv\Scripts\python -m app.cli.amazon_poc sync-listings
+   ```
+
+   Each command prints one line per run — status and counts — and exits
+   non-zero if any run ended `FAILED`. Every run is recorded in
+   `amazon_sync_runs` with an audit event.
+
+4. Look at the result:
+
+   ```powershell
+   .\.venv\Scripts\python -m app.cli.amazon_poc velocity --top 25
+   .\.venv\Scripts\python -m app.cli.amazon_poc velocity --level product
+   ```
+
+   Columns: seller SKU, ASIN, Catalog Item #, UPC, units 7/14/30 days,
+   average daily (14 d), fulfillable, FBM, inbound, days of supply, mapping
+   method. A `-` means the value is not known, never a guessed zero.
+
+**Scheduled ingestion.** With `AMAZON_ENABLED=true` the API process runs the
+same three syncs on a schedule (`AMAZON_ORDERS_INTERVAL_MINUTES`,
+`AMAZON_INVENTORY_INTERVAL_MINUTES`, `AMAZON_LISTINGS_INTERVAL_MINUTES`;
+defaults 24 h / 60 min / 24 h). The scheduler is in-process and must run in
+exactly one process. A run left `RUNNING` by a crashed process is closed as
+`FAILED` ("timed out") after `AMAZON_RUN_TIMEOUT_MINUTES` before the next
+one starts. With more than one organization in the database, set
+`AMAZON_ORGANIZATION_SLUG` to say which one the Amazon account belongs to.
+
+Exit codes: `0` ok · `1` a run FAILED · `2` configuration or credentials ·
+`3` unexpected error.
 
 ## Health endpoints
 
