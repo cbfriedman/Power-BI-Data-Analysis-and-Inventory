@@ -61,6 +61,9 @@ def test_the_migration_creates_every_required_entity(migrated_engine: Engine) ->
         "nineyard_sync_runs",
         "source_records",
         "audit_events",
+        "amazon_sync_runs",
+        "amazon_order_lines",
+        "amazon_inventory_snapshots",
     }
 
     assert required <= set(_all_tables(migrated_engine))
@@ -229,3 +232,26 @@ def test_timestamps_are_stored_in_utc_regardless_of_session_timezone(
     # if the value was written as local wall-clock time.
     drift = abs((datetime.now(UTC) - organization.created_at).total_seconds())
     assert drift < 300, f"created_at appears to be local time, drift={drift}s"
+
+
+def test_amazon_order_lines_carry_no_buyer_or_shipping_column(migrated_engine: Engine) -> None:
+    """ADR 0011: no buyer PII, ever. Checked against the live table, not the model."""
+    with migrated_engine.connect() as connection:
+        columns = set(
+            connection.execute(
+                text(
+                    "select column_name from information_schema.columns"
+                    " where table_schema = 'public' and table_name = 'amazon_order_lines'"
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    offenders = {
+        c
+        for c in columns
+        if c.startswith(("ship_", "buyer_", "recipient_"))
+        or any(word in c for word in ("address", "phone", "email", "postal", "city"))
+    }
+    assert offenders == set(), f"PII-shaped columns on amazon_order_lines: {sorted(offenders)}"

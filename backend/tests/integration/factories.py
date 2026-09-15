@@ -19,6 +19,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models import (
+    AmazonInventorySnapshot,
+    AmazonOrderLine,
+    AmazonSyncRun,
     AvailabilityEvent,
     ImportFile,
     ImportJob,
@@ -38,6 +41,7 @@ from app.models import (
     VendorProduct,
 )
 from app.models.enums import (
+    AmazonSyncJobType,
     AvailabilityEventType,
     AvailabilityStatus,
     ExceptionReason,
@@ -46,6 +50,7 @@ from app.models.enums import (
     ImportJobStatus,
     Marketplace,
     SourceSystem,
+    SyncStatus,
 )
 
 _counter = itertools.count(1)
@@ -348,3 +353,65 @@ def make_mapping_exception(
     session.add(exception)
     session.flush()
     return exception
+
+
+# --- Amazon ingestion (ADR 0011) ---------------------------------------------
+
+
+def make_amazon_sync_run(
+    session: Session, organization: Organization, **kwargs: Any
+) -> AmazonSyncRun:
+    run = AmazonSyncRun(
+        organization_id=organization.id,
+        job_type=kwargs.pop("job_type", AmazonSyncJobType.FBA_INVENTORY),
+        status=kwargs.pop("status", SyncStatus.PENDING),
+        marketplace_id=kwargs.pop("marketplace_id", "ATVPDKIKX0DER"),
+        **kwargs,
+    )
+    session.add(run)
+    session.flush()
+    return run
+
+
+def make_amazon_order_line(
+    session: Session,
+    organization: Organization,
+    sync_run: AmazonSyncRun,
+    **kwargs: Any,
+) -> AmazonOrderLine:
+    now = datetime.now(UTC)
+    line = AmazonOrderLine(
+        organization_id=organization.id,
+        amazon_order_id=kwargs.pop("amazon_order_id", unique("111-0000000")),
+        seller_sku=kwargs.pop("seller_sku", unique("SKU")),
+        quantity_ordered=kwargs.pop("quantity_ordered", 1),
+        purchase_date=kwargs.pop("purchase_date", now),
+        last_updated_at=kwargs.pop("last_updated_at", now),
+        order_status=kwargs.pop("order_status", "Shipped"),
+        marketplace_id=kwargs.pop("marketplace_id", "ATVPDKIKX0DER"),
+        first_seen_sync_run_id=kwargs.pop("first_seen_sync_run_id", sync_run.id),
+        last_seen_sync_run_id=kwargs.pop("last_seen_sync_run_id", sync_run.id),
+        **kwargs,
+    )
+    session.add(line)
+    session.flush()
+    return line
+
+
+def make_amazon_inventory_snapshot(
+    session: Session,
+    organization: Organization,
+    sync_run: AmazonSyncRun,
+    **kwargs: Any,
+) -> AmazonInventorySnapshot:
+    snapshot = AmazonInventorySnapshot(
+        organization_id=organization.id,
+        sync_run_id=sync_run.id,
+        seller_sku=kwargs.pop("seller_sku", unique("SKU")),
+        asin=kwargs.pop("asin", "B000TEST01"),
+        captured_at=kwargs.pop("captured_at", datetime.now(UTC)),
+        **kwargs,
+    )
+    session.add(snapshot)
+    session.flush()
+    return snapshot

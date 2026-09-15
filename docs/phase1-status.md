@@ -1,7 +1,7 @@
 # Phase 1 Status
 
 Living document. It reflects **what is true**, not what is intended.
-Last updated: 2026-09-15 (read-only Amazon SP-API client — POC step 2)
+Last updated: 2026-09-15 (Amazon ingestion tables — POC step 3)
 
 ---
 
@@ -12,9 +12,9 @@ Last updated: 2026-09-15 (read-only Amazon SP-API client — POC step 2)
 | Milestone | 1 — Data foundation, ingestion, matching |
 | Stage | **Phase 1 complete; phase 3 diagnostic built.** Schema, audit service, configuration/security foundation, and a read-only Nineyard probe exist. Backend is deployed to Railway. |
 | Application code | Schema, audit service, auth foundation, error handling, redaction, read-only Nineyard client + CLI probe, tenant scoping helper for repositories (ADR 0012), Amazon SP-API configuration and a read-only SP-API client behind an anti-corruption layer (nothing calls it yet). No vendor/import/matching logic. |
-| Database schema | 21 tables, 21 enum types, 113 indexes, 61 check constraints, 73 foreign keys, 1 append-only trigger |
-| Migrations | 1 revision, applied and reversed against PostgreSQL 16.15 |
-| Backend tests | **468 passed** (`pytest`: 355 unit + 113 integration). `git grep -c "def test_"` finds 339 functions (225 unit, 114 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
+| Database schema | 24 tables, 22 enum types, 127 indexes, 74 check constraints, 80 foreign keys, 1 append-only trigger |
+| Migrations | 2 revisions (`506fd0ecc33a`, `3767ee979011`), applied and reversed against PostgreSQL 16.15 |
+| Backend tests | **516 passed** (`pytest`: 364 unit + 152 integration). `git grep -c "def test_"` finds 370 functions (225 unit, 145 integration — one of which is the `test_database_url` fixture helper in `conftest.py`); the difference is parametrisation. |
 | Quality gates | 8 of 8 passing locally **and in GitHub Actions** (§4), 2026-09-14 |
 | Docker stack | **Verified in CI** — full `docker compose up --build` from `.env.example`, API healthy against PostgreSQL, migration applied and checked, web answering (§4, §6 S1). Backend also live on Railway (§6 S2). |
 | Blocking questions open | 8 (see §7); B1 partially answered, B2 narrowed, B7 partially answered by ADR 0011, B8 new |
@@ -34,7 +34,7 @@ Phases are defined in [architecture.md §6](architecture.md#6-implementation-ord
 | — | Planning and documentation | ✅ Complete | Scope, architecture, criteria, 10 ADRs |
 | 0 | Scaffolding | ✅ Complete | Backend, frontend, infra, quality gates, GitHub Actions CI (2026-09-14) |
 | 1 | DB foundation + audit | ✅ Complete | Schema, migration, transactional audit writer, transaction utilities, config/security foundation |
-| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | 🟨 Client built, not yet used | Precedes phase 2 by client request (§10). **Exists:** typed settings, redaction rules, and `app/integrations/amazon/` — a read-only client over `python-amazon-sp-api` with five operations, typed DTOs, a five-class error taxonomy and a retry policy ([amazon-integration.md](amazon-integration.md)), tested against fakes only. **Does not exist:** tables, ingestion service, scheduler, endpoint, CLI. Nothing has run against the real account (B8). |
+| A | Amazon SP-API read-only ingestion ([ADR 0011](decisions/0011-amazon-sp-api-proof-of-concept-in-milestone-1.md)) | 🟨 Client and tables built | Precedes phase 2 by client request (§10). **Exists:** typed settings, redaction rules, the read-only client ([amazon-integration.md](amazon-integration.md)), and the three tables `amazon_sync_runs`, `amazon_order_lines`, `amazon_inventory_snapshots` (migration `3767ee979011`, [database-schema.md §3.9](database-schema.md)). **Does not exist:** ingestion service, scheduler, endpoint, CLI. Nothing has run against the real account (B8). |
 | 2 | Vendor database | ⬜ Not started | Tables exist; no API or CRUD. `require_roles(DATA_OPERATOR)` is ready to guard it. |
 | 3 | Nineyard integration + sync | 🟨 Diagnostic only | **Exists:** read-only client (`app/integrations/nineyard/client.py`, `errors.py`, `sanitize.py`), probe (`app/integrations/nineyard/probe.py`), and CLI (`app/cli/nineyard_probe.py`), tested by `tests/unit/test_nineyard_client.py`, `test_nineyard_probe.py`, `test_nineyard_cli.py` (mocked; no live calls). The public OpenAPI spec has been analysed ([nineyard-field-mapping.md](nineyard-field-mapping.md)). **Does not exist:** any sync service — nothing writes Nineyard data to `products`, `product_identifiers`, `marketplace_listings`, `nineyard_sync_runs`, or `nineyard_item_payloads`. The probe has not been run against the live API. See [nineyard-integration.md](nineyard-integration.md) and B1. |
 | 4 | Import profiles | ⬜ Not started | `vendor_import_profiles` exists; shape of the JSONB rules still depends on B3/B4 |
@@ -151,6 +151,40 @@ permits, and which is exactly the shape of a leak — and proves select, update
 and delete stay inside the caller's tenant, including a lookup by the other
 tenant's primary key. Assumption A19 is amended accordingly.
 
+### Amazon ingestion tables (2026-09-15, POC step 3)
+
+Migration `3767ee979011` adds three organization-scoped tables under every
+convention in CLAUDE.md §4 — UUID keys, `TIMESTAMPTZ`, named constraints,
+native enums — reusing the `sync_status` and `trigger_type` enums and adding
+one, `amazon_sync_job_type`. Full description in
+[database-schema.md §3.9](database-schema.md).
+
+* **`amazon_sync_runs`** — one row per ingestion execution and job type. A
+  partial unique index permits one `RUNNING` row per `(organization_id,
+  job_type)`, so a scheduler tick cannot start a second orders pull while
+  the first is still polling; a check keeps `completed_at` null while
+  `RUNNING`.
+* **`amazon_order_lines`** — grain is `(order, seller SKU)` because the
+  all-orders flat-file report has no order-item id; the ingestion aggregates
+  per pair before upserting. **No buyer or shipping column exists**, and a
+  schema test asserts that against the live table, not the model.
+* **`amazon_inventory_snapshots`** — append-only, unique per `(run, SKU)`,
+  indexed on `(organization_id, seller_sku, captured_at DESC)`.
+
+**Hand-checked after autogenerate.** Two things autogenerate gets wrong when
+a revision reuses enum types, both fixed and both covered by a test that
+downgrades exactly one step: the shared enums are declared with
+`create_type=False` so upgrade does not re-`CREATE TYPE` them, and downgrade
+drops only `amazon_sync_job_type` — dropping the shared two would take
+`nineyard_sync_runs` down with them. `alembic check` is clean; the
+`captured_at DESC` expression index compares correctly.
+
+**39 new integration tests** across the four schema test files: every unique
+(including the permitted case for each partial index), every check, every FK
+delete behaviour, the PII-column assertion, and the round trip. The
+tenant-scoping unit test picked up the three new tables automatically (+9
+cases), which is exactly what it was written to do.
+
 ### Amazon SP-API client — the anti-corruption layer (2026-09-15, POC step 2)
 
 `app/integrations/amazon/` wraps `python-amazon-sp-api` 2.1.23 (MIT, now a
@@ -252,12 +286,12 @@ file: https://github.com/cbfriedman/Power-BI-Data-Analysis-and-Inventory/actions
 
 | Gate | Command | Result |
 |---|---|---|
-| Backend format | `ruff format .` | ✅ 91 files unchanged |
+| Backend format | `ruff format .` | ✅ 93 files unchanged |
 | Backend lint | `ruff check .` | ✅ All checks passed |
-| Backend types | `mypy` (strict) | ✅ No issues in 89 source files |
-| Backend tests | `pytest` | ✅ `468 passed in 7.52s` — `tests/unit`: `355 passed`; `tests/integration`: `113 passed` |
-| Migration apply | `alembic upgrade head` | ✅ Applied to PostgreSQL 16.15 |
-| Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types |
+| Backend types | `mypy` (strict) | ✅ No issues in 90 source files |
+| Backend tests | `pytest` | ✅ `516 passed in 9.45s` — `tests/unit`: `364 passed`; `tests/integration`: `152 passed` |
+| Migration apply | `alembic upgrade head` | ✅ Both revisions applied to PostgreSQL 16.15 |
+| Migration reverse | `alembic downgrade base` → `upgrade head` | ✅ Clean round trip, 0 residual enum types; one-step downgrade of `3767ee979011` leaves the 21 shared types intact |
 | Migration drift | `alembic check` | ✅ No new upgrade operations detected |
 | Frontend lint | `npm run lint` | ✅ Clean |
 | Frontend types | `npm run typecheck` | ✅ Clean |

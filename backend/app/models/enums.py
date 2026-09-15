@@ -200,7 +200,7 @@ class WatchlistPriority(StrEnum):
 
 
 class SyncStatus(StrEnum):
-    """Lifecycle of a Nineyard catalog synchronisation run."""
+    """Lifecycle of a source-system synchronisation run (Nineyard or Amazon)."""
 
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -223,3 +223,16 @@ class ActorType(StrEnum):
     USER = "USER"
     SYSTEM = "SYSTEM"
     WORKER = "WORKER"
+
+
+class AmazonSyncJobType(StrEnum):
+    """Which SP-API read an Amazon ingestion run performs (ADR 0011).
+
+    One run does one kind of read, so a failure in the orders report does not
+    mask a successful inventory pull, and each kind can be scheduled on its
+    own cadence.
+    """
+
+    ORDERS_REPORT = "ORDERS_REPORT"
+    FBA_INVENTORY = "FBA_INVENTORY"
+    LISTINGS_REPORT = "LISTINGS_REPORT"

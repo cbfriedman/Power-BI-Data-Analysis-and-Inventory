@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.enums import (
+    AmazonSyncJobType,
     AvailabilityEventType,
     AvailabilityStatus,
     ExceptionStatus,
@@ -23,6 +24,7 @@ from app.models.enums import (
     ImportJobStatus,
     MappingStatus,
     SourceSystem,
+    SyncStatus,
 )
 from tests.integration import factories
 
@@ -694,3 +696,276 @@ def test_vendor_code_is_unique_within_an_organization(db_session: Session) -> No
 
     with pytest.raises(IntegrityError):
         factories.make_vendor(db_session, organization, code="ACME")
+
+
+# --- Amazon sync runs ----------------------------------------------------------
+
+
+def test_only_one_running_amazon_run_per_job_type(db_session: Session) -> None:
+    """A scheduler tick must not start a second orders pull mid-flight."""
+    organization = factories.make_organization(db_session)
+    factories.make_amazon_sync_run(
+        db_session,
+        organization,
+        job_type=AmazonSyncJobType.ORDERS_REPORT,
+        status=SyncStatus.RUNNING,
+        started_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_sync_run(
+            db_session,
+            organization,
+            job_type=AmazonSyncJobType.ORDERS_REPORT,
+            status=SyncStatus.RUNNING,
+            started_at=datetime.now(UTC),
+        )
+
+
+def test_different_job_types_may_run_concurrently(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    for job_type in AmazonSyncJobType:
+        factories.make_amazon_sync_run(
+            db_session,
+            organization,
+            job_type=job_type,
+            status=SyncStatus.RUNNING,
+            started_at=datetime.now(UTC),
+        )
+
+
+def test_a_finished_run_frees_the_running_slot(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    started = datetime.now(UTC)
+    factories.make_amazon_sync_run(
+        db_session,
+        organization,
+        job_type=AmazonSyncJobType.FBA_INVENTORY,
+        status=SyncStatus.COMPLETED,
+        started_at=started,
+        completed_at=started + timedelta(minutes=1),
+    )
+
+    factories.make_amazon_sync_run(
+        db_session,
+        organization,
+        job_type=AmazonSyncJobType.FBA_INVENTORY,
+        status=SyncStatus.RUNNING,
+        started_at=datetime.now(UTC),
+    )
+
+
+def test_the_running_slot_is_per_organization(db_session: Session) -> None:
+    for _ in range(2):
+        organization = factories.make_organization(db_session)
+        factories.make_amazon_sync_run(
+            db_session,
+            organization,
+            job_type=AmazonSyncJobType.LISTINGS_REPORT,
+            status=SyncStatus.RUNNING,
+            started_at=datetime.now(UTC),
+        )
+
+
+def test_a_running_amazon_run_cannot_have_completed_at(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    started = datetime.now(UTC)
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_sync_run(
+            db_session,
+            organization,
+            status=SyncStatus.RUNNING,
+            started_at=started,
+            completed_at=started + timedelta(seconds=5),
+        )
+
+
+def test_a_completed_amazon_run_must_have_started(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_sync_run(
+            db_session,
+            organization,
+            status=SyncStatus.COMPLETED,
+            completed_at=datetime.now(UTC),
+        )
+
+
+def test_an_amazon_run_cannot_complete_before_it_started(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    started = datetime.now(UTC)
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_sync_run(
+            db_session,
+            organization,
+            status=SyncStatus.COMPLETED,
+            started_at=started,
+            completed_at=started - timedelta(seconds=1),
+        )
+
+
+def test_amazon_run_counts_cannot_be_negative(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_sync_run(db_session, organization, rows_failed=-1)
+
+
+def test_an_amazon_run_window_cannot_end_before_it_starts(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    start = datetime.now(UTC)
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_sync_run(
+            db_session,
+            organization,
+            window_start=start,
+            window_end=start - timedelta(days=1),
+        )
+
+
+# --- Amazon order lines --------------------------------------------------------
+
+
+def test_one_line_per_order_and_sku(db_session: Session) -> None:
+    """The flat-file report has no order-item id; (order, SKU) is the grain."""
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+    factories.make_amazon_order_line(
+        db_session, organization, run, amazon_order_id="111-1234567-1234567", seller_sku="A"
+    )
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_order_line(
+            db_session, organization, run, amazon_order_id="111-1234567-1234567", seller_sku="A"
+        )
+
+
+def test_the_same_order_may_carry_several_skus(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+    for sku in ("A", "B", "C"):
+        factories.make_amazon_order_line(
+            db_session, organization, run, amazon_order_id="111-1234567-1234567", seller_sku=sku
+        )
+
+
+def test_the_same_order_id_may_exist_in_another_organization(db_session: Session) -> None:
+    for _ in range(2):
+        organization = factories.make_organization(db_session)
+        run = factories.make_amazon_sync_run(db_session, organization)
+        factories.make_amazon_order_line(
+            db_session, organization, run, amazon_order_id="111-0000000-0000000", seller_sku="A"
+        )
+
+
+def test_quantity_ordered_cannot_be_negative(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_order_line(db_session, organization, run, quantity_ordered=-1)
+
+
+def test_a_zero_quantity_line_is_allowed(db_session: Session) -> None:
+    """A fully cancelled line still records that the order existed."""
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+
+    factories.make_amazon_order_line(
+        db_session, organization, run, quantity_ordered=0, order_status="Canceled"
+    )
+
+
+def test_an_item_price_requires_a_currency(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_order_line(
+            db_session, organization, run, item_price=Decimal("19.99"), currency=None
+        )
+
+
+def test_an_item_price_cannot_be_negative(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_order_line(
+            db_session, organization, run, item_price=Decimal("-1.00"), currency="USD"
+        )
+
+
+@pytest.mark.parametrize("field", ["amazon_order_id", "seller_sku"])
+def test_order_line_identifiers_cannot_be_blank(db_session: Session, field: str) -> None:
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_order_line(db_session, organization, run, **{field: "   "})
+
+
+# --- Amazon inventory snapshots ------------------------------------------------
+
+
+def test_one_inventory_snapshot_per_sku_per_run(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+    factories.make_amazon_inventory_snapshot(db_session, organization, run, seller_sku="A")
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_inventory_snapshot(db_session, organization, run, seller_sku="A")
+
+
+def test_inventory_history_accumulates_across_runs(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    for _ in range(3):
+        run = factories.make_amazon_sync_run(db_session, organization)
+        factories.make_amazon_inventory_snapshot(db_session, organization, run, seller_sku="A")
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "fulfillable",
+        "inbound_working",
+        "inbound_shipped",
+        "inbound_receiving",
+        "reserved_total",
+        "unfulfillable_total",
+        "researching_total",
+        "fbm_quantity",
+    ],
+)
+def test_inventory_quantities_cannot_be_negative(db_session: Session, field: str) -> None:
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_inventory_snapshot(db_session, organization, run, **{field: -1})
+
+
+def test_fbm_quantity_may_be_unknown(db_session: Session) -> None:
+    """Merchant-fulfilled stock comes from a different read; null is honest."""
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+
+    snapshot = factories.make_amazon_inventory_snapshot(
+        db_session, organization, run, fbm_quantity=None
+    )
+    db_session.refresh(snapshot)
+
+    assert snapshot.fbm_quantity is None
+    assert snapshot.fulfillable == 0  # server default, not null
+
+
+def test_inventory_snapshot_sku_cannot_be_blank(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+
+    with pytest.raises(IntegrityError):
+        factories.make_amazon_inventory_snapshot(db_session, organization, run, seller_sku=" ")

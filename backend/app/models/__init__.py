@@ -14,6 +14,7 @@ Conventions every model follows (CLAUDE.md §4, ADR 0002, ADR 0009):
 
 from __future__ import annotations
 
+from app.models.amazon import AmazonInventorySnapshot, AmazonOrderLine, AmazonSyncRun
 from app.models.audit import AuditEvent
 from app.models.catalog import MarketplaceListing, Product, ProductIdentifier
 from app.models.identity import Role, User, UserRole
@@ -26,6 +27,9 @@ from app.models.vendor import Vendor, VendorImportProfile, VendorProduct
 from app.models.watchlist import OosStatusHistory, OosWatchlistEntry
 
 __all__ = [
+    "AmazonInventorySnapshot",
+    "AmazonOrderLine",
+    "AmazonSyncRun",
     "AuditEvent",
     "AvailabilityEvent",
     "ImportFile",

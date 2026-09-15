@@ -76,9 +76,11 @@ def test_upgrade_then_downgrade_then_upgrade_succeeds(scratch_database_url: URL)
     run_migrations(scratch_database_url)
     after_first_upgrade = _counts(scratch_database_url)
 
-    # 21 business tables plus alembic_version.
-    assert after_first_upgrade["tables"] == 22
-    assert after_first_upgrade["enums"] == 21
+    # 24 business tables plus alembic_version; 22 enum types (21 from the
+    # initial schema, amazon_sync_job_type from 3767ee979011 — sync_status and
+    # trigger_type are shared, not duplicated).
+    assert after_first_upgrade["tables"] == 25
+    assert after_first_upgrade["enums"] == 22
     assert after_first_upgrade["triggers"] == 1
 
     downgrade_migrations(scratch_database_url)
@@ -152,6 +154,56 @@ def test_the_migration_creates_the_expected_index_coverage(
         # Event timestamp
         "ix_availability_events_organization_id_detected_at",
         "ix_audit_events_organization_id_occurred_at",
+        # Amazon ingestion (ADR 0011)
+        "uq_amazon_sync_runs_running_job",
+        "uq_amazon_order_lines_order_sku",
+        "ix_amazon_order_lines_sku_purchase_date",
+        "ix_amazon_order_lines_purchase_date",
+        "uq_amazon_inventory_snapshots_run_sku",
+        "ix_amazon_inventory_snapshots_sku_captured_at",
     }
 
     assert required <= indexes, f"missing indexes: {sorted(required - indexes)}"
+
+
+def test_the_amazon_revision_reverses_without_touching_shared_enums(
+    scratch_database_url: URL,
+) -> None:
+    """Downgrading one step must drop only the enum it created.
+
+    ``sync_status`` and ``trigger_type`` are shared with ``nineyard_sync_runs``;
+    dropping them would take that table's columns down with them.
+    """
+    run_migrations(scratch_database_url)
+    downgrade_migrations(scratch_database_url, "506fd0ecc33a")
+
+    engine = create_engine(scratch_database_url)
+    try:
+        with engine.connect() as connection:
+            enums = set(
+                connection.execute(text("select typname from pg_type where typtype = 'e'"))
+                .scalars()
+                .all()
+            )
+            tables = set(
+                connection.execute(
+                    text(
+                        "select table_name from information_schema.tables"
+                        " where table_schema = 'public' and table_type = 'BASE TABLE'"
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    finally:
+        engine.dispose()
+
+    assert "amazon_sync_job_type" not in enums
+    assert {"sync_status", "trigger_type"} <= enums
+    assert len(enums) == 21
+    assert not {t for t in tables if t.startswith("amazon_")}
+    assert "nineyard_sync_runs" in tables
+
+    # And it comes back cleanly.
+    run_migrations(scratch_database_url)
+    check_migrations(scratch_database_url)

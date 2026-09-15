@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import (
+    AmazonSyncRun,
     AuditEvent,
     ImportJob,
     ImportJobRow,
@@ -33,6 +34,7 @@ from app.models import (
     VendorInventorySnapshot,
 )
 from app.models.enums import ActorType, IdentifierType, SourceSystem
+from app.models.identity import User as UserModel
 from tests.integration import factories
 
 pytestmark = pytest.mark.integration
@@ -279,3 +281,92 @@ def test_an_import_job_exposes_its_file_and_rows(db_session: Session) -> None:
 
     assert job.import_file.id == import_file.id
     assert len(job.rows) == 1
+
+
+# --- Amazon ingestion (ADR 0011) ---------------------------------------------
+
+
+def test_an_amazon_run_with_order_lines_cannot_be_deleted(db_session: Session) -> None:
+    """Provenance is not collateral damage of a run cleanup."""
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+    factories.make_amazon_order_line(db_session, organization, run)
+
+    with pytest.raises(IntegrityError):
+        db_session.execute(delete(AmazonSyncRun).where(AmazonSyncRun.id == run.id))
+        db_session.flush()
+
+
+def test_an_amazon_run_with_inventory_snapshots_cannot_be_deleted(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+    factories.make_amazon_inventory_snapshot(db_session, organization, run)
+
+    with pytest.raises(IntegrityError):
+        db_session.execute(delete(AmazonSyncRun).where(AmazonSyncRun.id == run.id))
+        db_session.flush()
+
+
+def test_a_run_still_referenced_as_first_seen_cannot_be_deleted(db_session: Session) -> None:
+    """Both provenance columns restrict, not only the most recent one."""
+    organization = factories.make_organization(db_session)
+    first = factories.make_amazon_sync_run(db_session, organization)
+    latest = factories.make_amazon_sync_run(db_session, organization)
+    factories.make_amazon_order_line(
+        db_session,
+        organization,
+        latest,
+        first_seen_sync_run_id=first.id,
+        last_seen_sync_run_id=latest.id,
+    )
+
+    with pytest.raises(IntegrityError):
+        db_session.execute(delete(AmazonSyncRun).where(AmazonSyncRun.id == first.id))
+        db_session.flush()
+
+
+def test_an_empty_amazon_run_can_be_deleted(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    run = factories.make_amazon_sync_run(db_session, organization)
+
+    db_session.execute(delete(AmazonSyncRun).where(AmazonSyncRun.id == run.id))
+    db_session.flush()
+
+    assert db_session.get(AmazonSyncRun, run.id) is None
+
+
+def test_a_user_who_triggered_an_amazon_run_cannot_be_deleted(db_session: Session) -> None:
+    """RESTRICT, as with audit attribution: deactivate instead."""
+    organization = factories.make_organization(db_session)
+    user = factories.make_user(db_session, organization)
+    factories.make_amazon_sync_run(db_session, organization, triggered_by_user_id=user.id)
+
+    with pytest.raises(IntegrityError):
+        db_session.execute(delete(UserModel).where(UserModel.id == user.id))
+        db_session.flush()
+
+
+def test_an_organization_with_amazon_data_cannot_be_deleted(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    factories.make_amazon_sync_run(db_session, organization)
+
+    with pytest.raises(IntegrityError):
+        db_session.execute(delete(Organization).where(Organization.id == organization.id))
+        db_session.flush()
+
+
+def test_an_order_line_exposes_both_provenance_runs(db_session: Session) -> None:
+    organization = factories.make_organization(db_session)
+    first = factories.make_amazon_sync_run(db_session, organization)
+    latest = factories.make_amazon_sync_run(db_session, organization)
+    line = factories.make_amazon_order_line(
+        db_session,
+        organization,
+        latest,
+        first_seen_sync_run_id=first.id,
+        last_seen_sync_run_id=latest.id,
+    )
+    db_session.refresh(line)
+
+    assert line.first_seen_sync_run.id == first.id
+    assert line.last_seen_sync_run.id == latest.id

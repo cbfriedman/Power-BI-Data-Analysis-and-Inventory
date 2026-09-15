@@ -1,10 +1,11 @@
 # Database Schema — Milestone 1
 
-Status: **Implemented.** Migration `506fd0ecc33a` applied and verified against
+Status: **Implemented.** Migrations `506fd0ecc33a` (initial schema) and
+`3767ee979011` (Amazon ingestion, ADR 0011) applied and verified against
 PostgreSQL 16.
-Last updated: 2026-09-08
+Last updated: 2026-09-15
 
-21 tables, 21 native enum types, 113 indexes, 61 check constraints, 73 foreign
+24 tables, 22 native enum types, 127 indexes, 74 check constraints, 80 foreign
 keys, and one append-only trigger. The authoritative definition is
 [backend/app/models/](../backend/app/models/); this document explains the shape
 and the reasoning.
@@ -74,6 +75,12 @@ erDiagram
 
     NINEYARD_SYNC_RUNS ||--o{ SOURCE_RECORDS : "retains payloads"
     IMPORT_JOBS |o--o{ SOURCE_RECORDS : "retains payloads"
+
+    ORGANIZATIONS ||--o{ AMAZON_SYNC_RUNS : "ingests for"
+    USERS |o--o{ AMAZON_SYNC_RUNS : "triggered"
+    AMAZON_SYNC_RUNS ||--o{ AMAZON_ORDER_LINES : "first seen in"
+    AMAZON_SYNC_RUNS ||--o{ AMAZON_ORDER_LINES : "last seen in"
+    AMAZON_SYNC_RUNS ||--o{ AMAZON_INVENTORY_SNAPSHOTS : "captured"
 
     USERS |o--o{ AUDIT_EVENTS : "acted"
 
@@ -318,6 +325,69 @@ erDiagram
         timestamptz fetched_at
     }
 
+    AMAZON_SYNC_RUNS {
+        uuid id PK
+        uuid organization_id FK
+        enum job_type
+        enum status
+        enum trigger_type
+        timestamptz window_start
+        timestamptz window_end
+        text marketplace_id
+        text report_id
+        integer rows_seen
+        integer rows_created
+        integer rows_updated
+        integer rows_unchanged
+        integer rows_failed
+        timestamptz started_at
+        timestamptz completed_at
+        uuid triggered_by_user_id FK
+        text request_id
+    }
+
+    AMAZON_ORDER_LINES {
+        uuid id PK
+        uuid organization_id FK
+        text amazon_order_id UK
+        text seller_sku UK
+        text asin
+        integer quantity_ordered
+        timestamptz purchase_date
+        timestamptz last_updated_at
+        text order_status "as Amazon sends it"
+        text item_status
+        text fulfillment_channel
+        text sales_channel
+        text marketplace_id
+        text currency
+        numeric item_price
+        uuid first_seen_sync_run_id FK
+        uuid last_seen_sync_run_id FK
+        jsonb raw "kept columns only, never buyer fields"
+    }
+
+    AMAZON_INVENTORY_SNAPSHOTS {
+        uuid id PK
+        uuid organization_id FK
+        uuid sync_run_id FK
+        text seller_sku UK
+        text asin
+        text fnsku
+        text condition
+        integer fulfillable
+        integer inbound_working
+        integer inbound_shipped
+        integer inbound_receiving
+        integer reserved_total
+        integer unfulfillable_total
+        integer researching_total
+        integer fbm_quantity "null until fetched"
+        timestamptz amazon_last_updated_at
+        timestamptz captured_at
+        jsonb raw
+    }
+
     AUDIT_EVENTS {
         uuid id PK
         uuid organization_id FK
@@ -477,6 +547,44 @@ correctly refuses — the delete would fail anyway with a confusing error.
 deleted. A check constraint requires a `USER` action to name a user, and forbids
 a `SYSTEM` or `WORKER` action from borrowing one.
 
+### 3.9 Amazon ingestion (ADR 0011)
+
+| From | To | Delete | Notes |
+|---|---|---|---|
+| `amazon_sync_runs.triggered_by_user_id` | `users` | RESTRICT | As with audit attribution: a user who triggered a run is deactivated, never deleted. Null for scheduled runs. |
+| `amazon_order_lines.first_seen_sync_run_id` | `amazon_sync_runs` | RESTRICT | Provenance is not collateral damage of a run cleanup. |
+| `amazon_order_lines.last_seen_sync_run_id` | `amazon_sync_runs` | RESTRICT | Both provenance columns restrict, not only the latest. |
+| `amazon_inventory_snapshots.sync_run_id` | `amazon_sync_runs` | RESTRICT | History is append-only; the run that captured it stays. |
+
+**`amazon_sync_runs`** — one row per ingestion execution, one job type per
+row (`ORDERS_REPORT`, `FBA_INVENTORY`, `LISTINGS_REPORT`), reusing the
+`sync_status` and `trigger_type` enums from `nineyard_sync_runs`.
+`uq_amazon_sync_runs_running_job` is a partial unique index on
+`(organization_id, job_type) WHERE status = 'RUNNING'`: a scheduler tick cannot
+start a second orders pull while the first is still polling its report. A check
+constraint keeps `completed_at` null while `RUNNING`, so the status and the
+timestamp cannot disagree about whether the run is over.
+
+**`amazon_order_lines`** — the grain is **(order, seller SKU)**, not order
+item: the all-orders flat-file report carries no order-item id, and one order
+can list the same SKU on more than one line, so the ingestion aggregates per
+`(amazon_order_id, seller_sku)` before the upsert and `quantity_ordered` is
+the sum. `order_status` / `item_status` are stored as Amazon sends them rather
+than as an enum, because the vocabulary is Amazon's to change. **No buyer or
+shipping column exists on this table** — `raw` keeps only the columns the
+ingestion chose to retain — and a schema test asserts it against the live
+table. Indexed on `(organization_id, seller_sku, purchase_date)` for
+per-SKU velocity and `(organization_id, purchase_date)` for window scans.
+
+**`amazon_inventory_snapshots`** — append-only, one row per SKU per run
+(`uq_amazon_inventory_snapshots_run_sku`). FBA quantities are `NOT NULL`
+with a `0` default: the ingestion turns an omitted Amazon field into `0`
+explicitly, and `raw` keeps what Amazon actually sent so the two can be told
+apart. `fbm_quantity` is nullable because merchant-fulfilled stock comes from
+a different read. `ix_amazon_inventory_snapshots_sku_captured_at` is on
+`(organization_id, seller_sku, captured_at DESC)` — "latest position for this
+SKU" is an index-only walk.
+
 ---
 
 ## 4. Index coverage for required searches
@@ -491,14 +599,17 @@ a `SYSTEM` or `WORKER` action from borrowing one.
 | Import status | `ix_import_jobs_organization_id_status`, `ix_import_job_rows_import_job_id_status` |
 | OOS status | `ix_oos_watchlist_organization_id_current_status`, `ix_oos_status_history_organization_id_new_status` |
 | Event timestamp | `ix_availability_events_organization_id_detected_at`, `ix_audit_events_organization_id_occurred_at`, `ix_audit_events_entity` |
+| Amazon sales velocity per SKU | `ix_amazon_order_lines_sku_purchase_date`; window scans `ix_amazon_order_lines_purchase_date` |
+| Latest Amazon inventory position | `ix_amazon_inventory_snapshots_sku_captured_at` (`captured_at DESC`) |
+| One running Amazon job per type | `uq_amazon_sync_runs_running_job` (partial, `status = 'RUNNING'`) |
 
 Trigram indexes require the `pg_trgm` extension, created by the migration.
 
 ---
 
-## 5. Migration
+## 5. Migrations
 
-Single revision `506fd0ecc33a`, "initial milestone 1 schema".
+### `506fd0ecc33a` — initial milestone 1 schema
 
 Beyond the autogenerated tables it does four things autogenerate cannot infer,
 each in a named helper at the top of the file:
@@ -512,6 +623,23 @@ each in a named helper at the top of the file:
    with "type already exists". That failure would only ever surface in a real
    deployment, so a test asserts the round trip explicitly.
 
+### `3767ee979011` — Amazon sync runs, order lines and inventory snapshots
+
+Autogenerated, then hand-checked for the two things autogenerate gets wrong
+when a revision reuses enum types:
+
+1. `sync_status` and `trigger_type` already exist. They are declared with
+   `postgresql.ENUM(..., create_type=False)` so the upgrade does not try to
+   `CREATE TYPE` them again.
+2. Downgrade drops **only** `amazon_sync_job_type`, the one type this revision
+   introduces. Dropping the shared two would take `nineyard_sync_runs` down
+   with them. A test downgrades exactly one step and asserts the shared types
+   survive, then re-upgrades and runs `alembic check`.
+
+The `(organization_id, seller_sku, captured_at DESC)` expression index is
+declared in the model with `text("captured_at DESC")`; autogenerate renders
+it as a literal column and `alembic check` compares it correctly.
+
 ```bash
 alembic upgrade head      # apply
 alembic downgrade base    # fully reversible, verified by test
@@ -521,9 +649,9 @@ alembic downgrade base    # fully reversible, verified by test
 
 ## 6. Tests
 
-[backend/tests/integration/](../backend/tests/integration/) — 77 database-backed
-tests, all passing against PostgreSQL 16 (plus 21 unit tests elsewhere, 98 in
-total).
+[backend/tests/integration/](../backend/tests/integration/) — 152 database-backed
+tests, all passing against PostgreSQL 16. Current totals are in
+[phase1-status.md](phase1-status.md).
 
 | Module | Covers |
 |---|---|
@@ -531,7 +659,8 @@ total).
 | `test_constraints.py` | Every unique and check constraint, including the permitted case for each partial index |
 | `test_relationships.py` | RESTRICT / CASCADE / SET NULL behaviour, driven by Core deletes so the database is what is actually tested |
 | `test_audit_append_only.py` | The trigger, via ORM and raw SQL, plus actor consistency |
-| `test_migrations.py` | Upgrade → downgrade → upgrade on a scratch database, `alembic check` drift detection, and index coverage |
+| `test_migrations.py` | Upgrade → downgrade → upgrade on a scratch database, `alembic check` drift detection, index coverage, and a one-step downgrade of the Amazon revision proving shared enums survive |
+| `test_tenant_scoping.py` | The repository-layer tenant filter against two organisations (ADR 0012) |
 
 They run against a real PostgreSQL and skip with an explanation when none is
 reachable, so the unit suite still runs anywhere.
